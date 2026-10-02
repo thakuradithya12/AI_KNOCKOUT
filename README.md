@@ -1,10 +1,16 @@
 # AI Knockout
 
-**Competitive AI Execution Platform — Phase 1: Server Foundation**
+**AI Knockout — Participant and Worker-Control-Plane Prototype**
 
 ## Status
 
-🟢 **Phase 1 Complete** — Infrastructure foundation ready for development.
+**Current implementation status**
+
+- **IMPLEMENTED:** participant identity/authentication; submission, immutable quarantine and static validation; mock-only worker control protocol; separate worker gateway and listener entry point; enrollment and certificate lifecycle logic; execution-scoped artifact capabilities; leases/fencing; TLS configuration.
+- **NOT VERIFIED:** real TLS handshake/certificate transport; deployed worker listener; dedicated Linux/KVM worker; Kata; sandbox isolation.
+- **PARTICIPANT EXECUTION: DISABLED.** No participant artifact has been executed.
+
+This README began as the Phase 1 foundation guide. The status above reflects the current source tree; Compose still deploys only the participant API, PostgreSQL and Redis. See [Worker security status](docs/SECURE_EXECUTION_ENVIRONMENT_V1.md) for verification limits.
 
 ## What's Included
 
@@ -75,14 +81,9 @@ Host (Windows 11) → Docker Engine → aik-internal network
 - [Security](docs/SECURITY.md)
 - [Backup & Restore](docs/BACKUP_AND_RESTORE.md)
 
-## Phase Roadmap
+## Original Phase Roadmap (historical)
 
-- **Phase 1** ✅ Server Foundation
-- **Phase 2** — Authentication & Participant Identity
-- **Phase 3** — AI Submission & Validation
-- **Phase 4** — Sandboxed Execution
-- **Phase 5** — Tournament Engine
-- **Phase 6+** — Leaderboard, Spectator, Admin
+This early roadmap predates the implementation milestones listed above and is retained as historical planning context. Sandbox execution and later competition features remain gated and are not implemented.
 
 ## License
 

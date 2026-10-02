@@ -1,6 +1,6 @@
 # Participant submissions and intake validation
 
-This milestone implements participant-owned submissions, immutable version metadata, exact-byte quarantine storage and static validation. It does **not** implement participant-code execution, a sandbox, chess logic, matches, workers, tournament behavior or runtime eligibility.
+**Historical scope of this submission-intake milestone:** it implements participant-owned submissions, immutable version metadata, exact-byte quarantine storage and static validation. That milestone did **not** implement participant-code execution, a sandbox, chess logic, matches, workers, tournament behavior or runtime eligibility. Worker-control-plane implementation is documented separately in `SECURE_EXECUTION_ENVIRONMENT_V1.md`; participant execution remains disabled.
 
 ## Identity and records
 

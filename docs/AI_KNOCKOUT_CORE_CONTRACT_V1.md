@@ -9,22 +9,23 @@ This is a specification, not a description of existing functionality. MUST/MUST 
 
 This contract governs the first complete-match milestone: two independent participant AI packages play one complete, reproducible, server-authoritative standard chess game. It defines package intake, immutable identity, validation states, process communication, chess state, execution isolation, failure semantics, match binding, future worker communication, logical data models and event records.
 
-This freeze does NOT implement an upload API, artifact storage, validation service, sandbox runtime, chess runtime, match controller, tournament engine, worker service, leaderboard, spectator system, admin control center or public deployment. Existing authentication and identity behavior is outside scope and MUST remain unchanged.
+**Historical scope of the original contract-freeze task:** authoring this specification did not itself implement an upload API, artifact storage, validation service, sandbox runtime, chess runtime, match controller, tournament engine, worker service, leaderboard, spectator system, admin control center or public deployment. This historical sentence is not a statement of the current repository inventory. Existing authentication and identity behavior remains outside the contract decisions and MUST remain unchanged.
 
 ## 2. Current repository boundary
 
-The source inspection uses the project as authoritative. A preceding forensic audit is available in conversation history; no forensic-audit document was found in the repository.
+This table describes the current repository implementation, not the future requirements in this contract. It was reconciled against the checked-out source on 2026-10-02. It is not runtime/deployment verification.
 
 | Current source capability | Evidence |
 |---|---|
-| FastAPI app, health/readiness/version and static portal | backend/app/main.py; backend/app/api/v1/health.py |
-| PostgreSQL connectivity and SQLAlchemy sessions | backend/app/db/session.py |
-| Redis connectivity and rate-limit use | backend/app/services/redis.py; backend/app/services/rate_limiter.py |
-| Participant registration/profile/auth/sessions | backend/app/api/v1/participants.py; backend/app/api/v1/auth.py; backend/app/services/auth.py; migration 0002_phase2_identity_auth |
-| Current Compose services | api, postgres, redis in compose.yml |
-| Current tests | backend unit/integration tests and static frontend Node tests |
+| FastAPI participant app, health/readiness/version, static portal, PostgreSQL and Redis integration | backend/app/main.py; backend/app/api/v1/health.py; backend/app/db/session.py; backend/app/services/redis.py |
+| Participant registration, profile, authentication, sessions and rate limiting | backend/app/api/v1/participants.py; backend/app/api/v1/auth.py; backend/app/services/auth.py; backend/app/services/rate_limiter.py; migration 0002_phase2_identity_auth |
+| Submission/version API, exact-byte quarantine storage and static canonical USTAR/manifest validation | backend/app/api/v1/submissions.py; backend/app/services/submissions.py; backend/app/services/quarantine_storage.py; backend/app/services/submission_validation.py; migration 0003_submission_quarantine |
+| Worker identity, enrollment/activation/rotation/revocation, leases/fencing, capabilities, evidence and mock-only control protocol | backend/app/workers/service.py; backend/app/workers/schemas.py; backend/app/workers/mock.py; backend/app/models/worker.py; migration 0004_worker_control_protocol |
+| Separate worker ASGI gateway and Hypercorn listener entry point; fail-closed TLS configuration | backend/app/workers/gateway.py; backend/app/workers/serve.py; backend/app/workers/tls.py; backend/pyproject.toml |
+| Compose deployment boundary | compose.yml currently defines only api, postgres and redis; the worker gateway/listener is not a Compose service and is not deployed |
+| Isolated automated tests | backend/tests/unit, backend/tests/integration and backend/app/static/tests; worker transport tests use a synthetic ASGI TLS extension |
 
-No source route, model, migration, service, worker or test implementing artifact submission, validation, sandbox execution, chess rules, AI protocol, match control/persistence, tournament, workers, leaderboard, live spectator or competition administration was found. Existing auth_events are identity/security audit records, not competition events. The portal’s non-identity sections are unavailable states, not backend features. The preceding audit could not independently verify Docker container health; this document is not runtime evidence.
+Real TLS handshake and certificate transport are **NOT VERIFIED**. Dedicated Linux/KVM worker deployment, Kata, sandbox isolation and participant-code execution are **NOT IMPLEMENTED / NOT VERIFIED**; participant execution remains disabled. The repository has no chess rules runtime, AIK protocol runner, match controller/persistence, tournament engine, leaderboard, live spectator service or competition administration. Submission `competition_events` are outbox records, while existing `auth_events` are identity/security audit records; no competition-event publisher or live event service is implemented. The portal’s non-identity sections remain unavailable states. This inventory is source evidence, not proof of runtime health.
 
 ## 3. Architectural principles and trust boundaries
 
@@ -463,7 +464,7 @@ Mitigations below are required future controls, not claims about current code.
 
 ## 17. Explicit non-goals
 
-This contract task does not implement: participant upload API; artifact storage; validation service; sandbox runtime or Docker/gVisor changes; chess runtime or move validation; match controller/clock/persistence; tournament engine; workers; leaderboard; spectator system; admin center; public deployment; frontend changes; database/schema changes or migrations.
+**Historical scope of the original contract-authoring task:** it did not implement a participant upload API, artifact storage, validation service, sandbox runtime or Docker/gVisor changes, chess runtime or move validation, match controller/clock/persistence, tournament engine, workers, leaderboard, spectator system, admin center, public deployment, frontend changes, or database/schema changes and migrations. This records the scope of that task, not the current repository inventory.
 
 ## 18. Open policy decisions
 

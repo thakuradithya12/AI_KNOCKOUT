@@ -139,7 +139,11 @@ docker compose exec api alembic downgrade -1
 
 All timestamps stored in the database and emitted in logs use **UTC**. The PostgreSQL database timezone is set to UTC. Python code uses `datetime.now(timezone.utc)`.
 
-## Extension Points
+## Current worker-control-plane status
+
+Worker protocol code lives in a separate ASGI application and listener entry point (`backend/app/workers/gateway.py`, `backend/app/workers/serve.py`). It is not mounted in the participant API and is not a Compose service. Enrollment and certificate lifecycle logic, TLS configuration, execution-scoped artifact capabilities, and lease/fencing are implemented. The listener has not been deployed or tested with a real TLS handshake. The current protocol is mock-only; no participant package is executed. Dedicated Linux/KVM, Kata, sandbox isolation, chess execution and match/tournament services are not implemented or verified.
+
+## Original Phase-1 Extension Points (historical)
 
 Future phases will add:
 - **Authentication middleware** on the FastAPI app
@@ -149,4 +153,4 @@ Future phases will add:
 - **Additional database models** via Alembic migrations
 - **Redis queues** for match scheduling
 
-The current architecture is designed to support these additions without rebuilding the foundation.
+This list records anticipated additions at the time of the Phase-1 architecture document. It is not a current inventory; use the status sections above and in `SECURE_EXECUTION_ENVIRONMENT_V1.md` for current implementation and verification state.

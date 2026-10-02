@@ -5,8 +5,7 @@
 This document outlines the security architecture, baseline controls, threat assumptions, and ethical hacker review for **Phase 1: Production Server Foundation** of the AI Knockout project.
 
 > [!IMPORTANT]
-> Phase 1 provides the infrastructure and API server foundation only.
-> Participant code execution and sandboxing remain deferred. Submission acceptance and static validation exist; worker control-plane support is mock-only and not deployed.
+> **Historical Phase-1 scope snapshot:** that phase established the infrastructure and API foundation. Submission acceptance/static validation and a mock-only worker control-plane prototype were added in later milestones. Current implementation and verification status is in Section 6.
 
 ---
 
@@ -59,9 +58,11 @@ This document outlines the security architecture, baseline controls, threat assu
 
 ---
 
-## 4. Known Limitations & Future Work
+## 4. Historical Phase-1 Limitations Snapshot
 
-| Item | Current Status (Phase 1) | Scheduled Resolution |
+The following table records the security status when the Phase-1 baseline document was written. It is historical; current worker-control-plane implementation and verification status are summarized in Section 6 below.
+
+| Item | Phase-1 snapshot | Planned resolution at that time |
 |---|---|---|
 | Participant TLS / HTTPS | HTTP plaintext locally | Reverse proxy with TLS termination in production |
 | Participant authentication | Participant identity/session authentication implemented | Production TLS deployment and operations review |
@@ -83,8 +84,8 @@ This document outlines the security architecture, baseline controls, threat assu
 - [x] Security headers are attached to all HTTP responses.
 - [x] Database is not exposed on standard public port (5432).
 
-## 6. Worker trust prototype status (mock-only)
+## 6. Current implementation and verification status
 
-The worker protocol prototype adds a separate, unmounted `/worker/v1` gateway application, per-worker certificate identity records, one-time enrollment tokens, fail-closed TLS configuration validation, explicit certificate activation/rotation/revocation, worker-scoped job leases/fencing, short-lived one-use artifact capabilities, bounded non-authoritative evidence, and append-only security events. Participant bearer credentials are rejected by the worker gateway. Worker private keys are not stored in PostgreSQL. Gateway startup requires `WORKER_DATABASE_URL` separately from the participant API database setting. See `SECURE_EXECUTION_ENVIRONMENT_V1.md` for the full design and operational limits.
+**IMPLEMENTED:** participant identity/authentication; submission and quarantine; mock-only worker control protocol; separate worker gateway; enrollment; certificate activation/rotation/revocation logic; execution-scoped artifact capabilities; leases/fencing; TLS configuration. Participant bearer credentials are rejected by the worker gateway. Worker private keys are not stored in PostgreSQL. Gateway startup requires `WORKER_DATABASE_URL` separately from the participant API database setting.
 
-This is not a deployed worker service. A separate Hypercorn mTLS listener entry point exists, but no real mTLS handshake has been verified; the migration has not been applied, and least-privilege database grants have not been implemented. Tests use synthetic ASGI TLS identity and controlled fixture artifacts. They are **MOCKED — DOES NOT PROVE SANDBOX SECURITY**. No participant package was executed. Real sandbox execution is **NOT IMPLEMENTED / NOT VERIFIED** and remains blocked until a dedicated Linux/KVM worker with the approved Kata runtime and the full security gate is available. Network, host filesystem, privilege, resource-limit, container escape, cross-execution and Kata isolation properties are **NOT VERIFIED — DEDICATED WORKER REQUIRED**.
+**NOT VERIFIED:** real TLS handshake and certificate transport; deployed worker listener; dedicated Linux/KVM worker; Kata; sandbox isolation. The Hypercorn listener entry point exists but is not deployed or handshake-verified. The migration has not been applied, and least-privilege database grants have not been implemented. Tests use synthetic ASGI TLS identity and controlled fixture artifacts; they are **MOCKED — DOES NOT PROVE SANDBOX SECURITY**. **PARTICIPANT EXECUTION: DISABLED.** No participant package was executed. Network, host filesystem, privilege, resource-limit, container escape, cross-execution and Kata isolation properties are **NOT VERIFIED — DEDICATED WORKER REQUIRED**. See `SECURE_EXECUTION_ENVIRONMENT_V1.md` for details.
