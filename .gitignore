@@ -1,0 +1,84 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Private credentials and TLS material (development/test certificates must stay local)
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+certs/
+certificates/
+private/
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+
+# Testing
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Docker
+*.log
+
+# Backups
+backups/
+*.sql
+*.sql.gz
+*.dump
+*.bak
+# Keep the intentional PostgreSQL initialization source under version control.
+!infra/postgres/init/*.sql
+
+# Local runtime data and generated artifacts
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+*.tmp
+*.temp
+*.tar
+*.zip
+runtime/
+uploads/
+quarantine/
+
+# Temporary
+tmp/
+temp/
+scratch/
