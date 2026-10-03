@@ -1,6 +1,6 @@
 # AI Knockout — Secure Participant AI Execution Environment V1
 
-**Status:** Design specification plus a mock-only worker control-plane protocol prototype. REAL SANDBOX EXECUTION: NOT IMPLEMENTED / NOT VERIFIED.  
+**Status:** Design specification, mock-only worker control-plane protocol prototype, and typed sandbox-boundary contract with an inert fake adapter. REAL SANDBOX EXECUTION: NOT IMPLEMENTED / NOT VERIFIED.
 **Scope:** Future execution of hostile participant Python packages after static validation and authorized match binding.  
 **Policy status:** Values marked **PROPOSED / ORGANIZER APPROVAL REQUIRED** are engineering starting points, not approved event rules.
 
@@ -483,6 +483,23 @@ The PostgreSQL migration adds the worker/enrollment/job/capability/evidence/secu
 - **REAL SANDBOX EXECUTION:** **NOT IMPLEMENTED / NOT VERIFIED**. No participant artifact was executed. Container escape resistance, network isolation, host filesystem/privilege isolation, resource-limit enforcement, Kata isolation, and cross-execution isolation are **NOT VERIFIED — DEDICATED WORKER REQUIRED**.
 
 The current environment has no accessible Docker daemon and no Kata runtime. Worker gateway, job creation, token issuance, listener binding, certificate issuance tooling, and migration application are not wired into Compose or the participant API. This prototype does not implement a live worker agent, CA signing/provisioning tooling, sandbox launcher, process lifecycle, chess, AIK match loop, tournament, leaderboard, spectator feed or admin UI. Resource policy includes provisional defaults from the contract, while move timeout, total process lifetime and concurrency require organizer-approved values. No worker suitability scheduler/admission controller is implemented.
+
+### Sandbox launcher contract milestone status (Windows-safe; added after the original design)
+
+The execution invariants in this document and the server-authority rules in Core Contract V1 are frozen. This subsection records interface progress only; it does not change contract semantics, approve provisional policy values, enable execution, or imply Linux/Kata controls.
+
+| Status | Boundary |
+|---|---|
+| **IMPLEMENTED** | `backend/app/sandbox/contract.py` defines immutable `ExecutionIdentity`, bounded `SandboxPolicy`, explicit execution states, legal transition checks, typed adapter operations, bounded evidence types, failure classes, and a typed AIK JSONL byte transport. The only network policy representable is `DENY_ALL`; writable storage is only a private temporary-storage policy. |
+| **SIMULATED ONLY** | `FakeSandboxAdapter` models lifecycle, exact digest/version matching, lease/fence rejection, inert timeout/resource/protocol/crash observations, output fixtures, cleanup outcomes, and evidence. It never extracts, imports, or executes artifact contents and cannot declare a chess result. `SandboxSupervisor` coordinates the fake boundary, checks a lease/fence authority, uses monotonic deadlines, requests termination on stale fencing, and classifies bounded observations. Tests use inert bytes only. |
+| **IMPLEMENTED** | AIK transport bounds message and cumulative input/output/evidence sizes, requires newline-delimited UTF-8 JSON, rejects duplicate JSON keys, duplicate messages, late messages and unknown participant message schemas. Participant output is restricted to `ready`, `ack`, `bestmove`, and `claim_draw`; `game_over` or a result claim is rejected. Move shape checks are syntactic only; trusted chess legality remains outside this module and is not implemented. |
+| **IMPLEMENTED** | `approve_submission_for_eligibility()` is an internal domain service requiring an explicit `OrganizerApproval` assertion. It performs only `APPROVED` → `ELIGIBLE`, preserves the immutable submission version and digest, and writes the append-only transition and competition event in the same transaction. It does not automatically promote submissions and is not exposed as a participant/public API. The repository has no organizer authentication interface; the trusted caller must authenticate/authorize the actor before invoking it. |
+| **REQUIRES REAL LINUX** | A launcher and supervisor implementation that enforces processes, namespaces, cgroups, filesystem, network, resource limits, deadlines, output draining, termination, evidence, and cleanup. No such runtime implementation exists. |
+| **REQUIRES KVM/KATA** | The selected per-participant microVM boundary, guest lifecycle, host separation, escape resistance, resource enforcement across the configured runtime, and teardown verification. None is implemented or verified. |
+
+The adapter interface contains no arbitrary participant-selected runtime flags. Its fake implementation is not wired to `backend/app/workers/`, the gateway, job creation, a database, or any real launcher. The contracts do not stage or extract arbitrary archive members on Windows; the fake holds immutable exact bytes solely to exercise digest/version binding. The supervisor is an interface-level coordinator, not a production worker watchdog: no live lease source, process handle, KVM VM, or cleanup evidence source is connected. `COMPLETED` denotes only a simulated process lifecycle state and never a chess outcome.
+
+The test suite `backend/tests/unit/test_sandbox_contract.py` verifies these inert contracts. Passing it proves no runtime isolation property. Real Linux/KVM/Kata acceptance remains governed by §§14–18 and the security gate; participant code remains disabled.
 
 ## 22. Reference material reviewed
 

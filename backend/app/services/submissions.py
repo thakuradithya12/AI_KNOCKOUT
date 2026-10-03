@@ -12,14 +12,22 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.competition import (
-    ArtifactState, ArtifactStateTransition, CompetitionEvent,
-    Submission, SubmissionVersion, ValidationAttempt, ValidationOutcome,
-)
-from app.services.submission_validation import (
-    PackageLimits, PackageRejected, POLICY_VERSION, VALIDATOR_VERSION,
-    validate_submission_package,
+    ArtifactState,
+    ArtifactStateTransition,
+    CompetitionEvent,
+    Submission,
+    SubmissionVersion,
+    ValidationAttempt,
+    ValidationOutcome,
 )
 from app.services.quarantine_storage import quarantine_storage
+from app.services.submission_validation import (
+    POLICY_VERSION,
+    VALIDATOR_VERSION,
+    PackageLimits,
+    PackageRejected,
+    validate_submission_package,
+)
 
 
 class StorageIntegrityError(RuntimeError):
@@ -31,6 +39,24 @@ class UploadResult:
     version: SubmissionVersion
     validation: ValidationAttempt
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class OrganizerApproval:
+    """Explicit approval assertion from a trusted organizer/control-plane caller."""
+
+    actor_id: str
+    reason_code: str
+    approval_reference: str
+    correlation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.actor_id or len(self.actor_id) > 64:
+            raise ValueError("ORGANIZER_ACTOR_INVALID")
+        if not self.reason_code or len(self.reason_code) > 64:
+            raise ValueError("ORGANIZER_APPROVAL_REASON_REQUIRED")
+        if not self.approval_reference or len(self.approval_reference) > 64:
+            raise ValueError("ORGANIZER_APPROVAL_REFERENCE_REQUIRED")
 
 
 def _now() -> datetime:
@@ -114,6 +140,62 @@ async def get_owned_submission(
     if lock:
         stmt = stmt.with_for_update()
     return (await db.execute(stmt)).scalar_one_or_none()
+
+
+async def approve_submission_for_eligibility(
+    db: AsyncSession,
+    *,
+    submission_version_id: uuid.UUID,
+    approval: OrganizerApproval,
+) -> SubmissionVersion:
+    """Record an explicit organizer decision; never promotes automatically.
+
+    This internal domain operation must only be called after the trusted
+    organizer-authentication boundary has authorized ``approval.actor_id``.
+    The existing immutable version/digest fields are only read and retained.
+    """
+    version = (
+        await db.execute(
+            select(SubmissionVersion)
+            .where(SubmissionVersion.id == submission_version_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if version is None:
+        raise LookupError("SUBMISSION_VERSION_NOT_FOUND")
+    if version.state != ArtifactState.APPROVED:
+        raise ValueError("SUBMISSION_VERSION_NOT_AWAITING_ORGANIZER_APPROVAL")
+
+    old_state = version.state
+    version.state = ArtifactState.ELIGIBLE
+    db.add(_transition(
+        version=version, old=old_state, new=ArtifactState.ELIGIBLE,
+        actor_kind="organizer", actor_id=approval.actor_id,
+        reason=approval.reason_code, correlation_id=approval.correlation_id,
+    ))
+    sequence = await db.scalar(
+        select(func.max(CompetitionEvent.aggregate_sequence)).where(
+            CompetitionEvent.aggregate_type == "submission_version",
+            CompetitionEvent.aggregate_id == version.id,
+        )
+    )
+    db.add(_event(
+        event_type="submission.eligibility_approved", actor_kind="organizer",
+        actor_id=approval.actor_id, aggregate_type="submission_version",
+        aggregate_id=version.id, sequence=(sequence or 0) + 1,
+        metadata={
+            "from_state": ArtifactState.APPROVED.value,
+            "to_state": ArtifactState.ELIGIBLE.value,
+            "reason_code": approval.reason_code,
+            "approval_reference": approval.approval_reference,
+            "submission_version": version.version,
+            "artifact_sha256": version.artifact_sha256,
+        },
+        correlation_id=approval.correlation_id,
+    ))
+    await db.commit()
+    await db.refresh(version)
+    return version
 
 
 async def accept_upload(

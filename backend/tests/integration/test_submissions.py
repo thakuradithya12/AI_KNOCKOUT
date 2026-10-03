@@ -7,8 +7,7 @@ import uuid
 
 import httpx
 import pytest
-from sqlalchemy import func, select
-from sqlalchemy import text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.competition import (
@@ -18,6 +17,10 @@ from app.models.competition import (
     QuarantineObject,
     SubmissionVersion,
     ValidationAttempt,
+)
+from app.services.submissions import (
+    OrganizerApproval,
+    approve_submission_for_eligibility,
 )
 from tests.unit.test_submission_validation import _valid_tar
 
@@ -49,6 +52,69 @@ async def _create_submission(client: httpx.AsyncClient, headers: dict[str, str])
 
 @pytest.mark.integration
 class TestSubmissionIntake:
+    async def test_eligibility_requires_explicit_audited_organizer_approval(
+        self, api_client: httpx.AsyncClient, db_session: AsyncSession
+    ):
+        _, headers = await _authenticated(api_client)
+        submission_id = await _create_submission(api_client, headers)
+        response = await api_client.post(
+            f"/api/v1/submissions/{submission_id}/versions", content=_valid_tar(),
+            headers={**headers, "Content-Type": "application/x-tar"},
+        )
+        assert response.status_code == 201
+        original = response.json()["version"]
+        version_id = uuid.UUID(original["id"])
+
+        approved = await approve_submission_for_eligibility(
+            db_session,
+            submission_version_id=version_id,
+            approval=OrganizerApproval(
+                actor_id="organizer-test-1", reason_code="MANUAL_REVIEW_PASSED",
+                approval_reference="review-ticket-123",
+            ),
+        )
+        assert approved.state == ArtifactState.ELIGIBLE
+        assert approved.artifact_sha256 == original["artifact_sha256"]
+        assert approved.id == version_id
+
+        transition = await db_session.scalar(
+            select(ArtifactStateTransition).where(
+                ArtifactStateTransition.submission_version_id == version_id,
+                ArtifactStateTransition.to_state == ArtifactState.ELIGIBLE,
+            )
+        )
+        event = await db_session.scalar(
+            select(CompetitionEvent).where(
+                CompetitionEvent.aggregate_id == version_id,
+                CompetitionEvent.event_type == "submission.eligibility_approved",
+            )
+        )
+        assert transition.from_state == ArtifactState.APPROVED.value
+        assert transition.actor_kind == "organizer"
+        assert transition.actor_id == "organizer-test-1"
+        assert event.metadata_json["approval_reference"] == "review-ticket-123"
+        assert event.metadata_json["artifact_sha256"] == original["artifact_sha256"]
+
+    async def test_eligibility_service_does_not_promote_rejected_version(
+        self, api_client: httpx.AsyncClient, db_session: AsyncSession
+    ):
+        _, headers = await _authenticated(api_client)
+        submission_id = await _create_submission(api_client, headers)
+        response = await api_client.post(
+            f"/api/v1/submissions/{submission_id}/versions", content=b"not-an-archive",
+            headers={**headers, "Content-Type": "application/x-tar"},
+        )
+        assert response.status_code == 422
+        version_id = uuid.UUID(response.json()["version"]["id"])
+        with pytest.raises(ValueError, match="NOT_AWAITING_ORGANIZER_APPROVAL"):
+            await approve_submission_for_eligibility(
+                db_session, submission_version_id=version_id,
+                approval=OrganizerApproval(
+                    actor_id="organizer-test-1", reason_code="MANUAL_REVIEW_PASSED",
+                    approval_reference="review-ticket-124",
+                ),
+            )
+
     async def test_submission_creation_uses_existing_auth_identity(self, api_client: httpx.AsyncClient):
         participant_id, headers = await _authenticated(api_client)
         created = await api_client.post("/api/v1/submissions", headers=headers)
