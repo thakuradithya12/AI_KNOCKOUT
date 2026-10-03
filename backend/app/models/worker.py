@@ -7,21 +7,20 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
     Enum,
-    event,
     ForeignKey,
     Integer,
-    JSON,
     String,
-    Text,
     UniqueConstraint,
     Uuid,
+    event,
     func,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
@@ -41,6 +40,7 @@ class ExecutionJobStatus(str, enum.Enum):
     QUEUED = "QUEUED"
     LEASED = "LEASED"
     ACKNOWLEDGED = "ACKNOWLEDGED"
+    CLEANUP_REPORTED = "CLEANUP_REPORTED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
@@ -75,13 +75,19 @@ class Worker(Base):
     )
     pending_certificate_identity: Mapped[str | None] = mapped_column(String(512), nullable=True)
     pending_certificate_serial: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    pending_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    pending_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_issued_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    pending_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     pending_capabilities: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     pending_software_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pending_runtime_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[WorkerStatus] = mapped_column(
-        Enum(WorkerStatus, native_enum=False, length=24), nullable=False, default=WorkerStatus.PENDING
+        Enum(WorkerStatus, native_enum=False, length=24),
+        nullable=False,
+        default=WorkerStatus.PENDING,
     )
     issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -89,7 +95,9 @@ class Worker(Base):
     capabilities: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     software_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     runtime_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     security_state: Mapped[str] = mapped_column(String(32), nullable=False, default="UNREVIEWED")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -133,7 +141,9 @@ class WorkerExecutionJob(Base):
     immutable_artifact_ref: Mapped[str] = mapped_column(String(128), nullable=False)
     runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
     protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    execution_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="MOCK_PROTOCOL_ONLY")
+    execution_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="MOCK_PROTOCOL_ONLY"
+    )
     initial_state: Mapped[dict] = mapped_column(JSON, nullable=False)
     resource_policy: Mapped[dict] = mapped_column(JSON, nullable=False)
     execution_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -146,7 +156,9 @@ class WorkerExecutionJob(Base):
     )
     lease_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_operation_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -226,7 +238,9 @@ class WorkerSecurityEvent(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    execution_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True, index=True)
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True, index=True
+    )
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False, default="INFO")
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -254,7 +268,11 @@ def _guard_worker_records(session, flush_context, instances) -> None:
                 raise ValueError("WORKER_JOB_IDENTITY_IMMUTABLE")
             for name in ("fencing_token", "last_sequence"):
                 history = state.attrs[name].history
-                if history.has_changes() and history.deleted and getattr(obj, name) < history.deleted[0]:
+                if (
+                    history.has_changes()
+                    and history.deleted
+                    and getattr(obj, name) < history.deleted[0]
+                ):
                     raise ValueError("WORKER_JOB_FENCE_SEQUENCE_CANNOT_DECREASE")
         elif isinstance(obj, (WorkerEvidence, WorkerSecurityEvent)):
             raise ValueError("WORKER_AUDIT_RECORD_APPEND_ONLY")

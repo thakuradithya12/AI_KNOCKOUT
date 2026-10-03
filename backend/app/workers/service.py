@@ -118,6 +118,33 @@ async def issue_certificate_rotation_token(
         raise WorkerProtocolError(409, "WORKER_NOT_ROTATABLE")
     if worker.pending_certificate_fingerprint is not None:
         raise WorkerProtocolError(409, "WORKER_ROTATION_ALREADY_PENDING")
+    now = _now()
+    # Expired unused authorizations no longer reserve the partial unique slot.
+    await db.execute(
+        update(WorkerEnrollmentToken)
+        .where(
+            WorkerEnrollmentToken.worker_id == worker_id,
+            WorkerEnrollmentToken.purpose == "ROTATE",
+            WorkerEnrollmentToken.used_at.is_(None),
+            WorkerEnrollmentToken.revoked_at.is_(None),
+            WorkerEnrollmentToken.expires_at <= now,
+        )
+        .values(revoked_at=now)
+    )
+    outstanding = (
+        await db.execute(
+            select(WorkerEnrollmentToken.id)
+            .where(
+                WorkerEnrollmentToken.worker_id == worker_id,
+                WorkerEnrollmentToken.purpose == "ROTATE",
+                WorkerEnrollmentToken.used_at.is_(None),
+                WorkerEnrollmentToken.revoked_at.is_(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if outstanding is not None:
+        raise WorkerProtocolError(409, "WORKER_ROTATION_TOKEN_OUTSTANDING")
     raw_token = secrets.token_urlsafe(32)
     db.add(WorkerEnrollmentToken(
         worker_id=worker_id, token_hash=_hash_token(raw_token), approved_by=approved_by,
@@ -688,25 +715,55 @@ async def submit_cleanup(
     })
     if final_status not in {ExecutionJobStatus.COMPLETED, ExecutionJobStatus.FAILED}:
         raise WorkerProtocolError(422, "FINAL_STATUS_INVALID")
-    if not cleanup_verified:
-        job.status = ExecutionJobStatus.FAILED
-        db.add(_audit(
-            event_type="WORKER_CLEANUP_UNVERIFIED", actor_id=worker.worker_id,
-            worker_id=worker.worker_id, execution_id=execution_id, severity="CRITICAL",
-        ))
-        await db.commit()
-        raise WorkerProtocolError(409, "CLEANUP_NOT_VERIFIED")
-    job.status = final_status
+    # A worker claim, even when true, is evidence only. A privileged control
+    # plane caller must make the authoritative terminal transition.
+    job.status = ExecutionJobStatus.CLEANUP_REPORTED
     job.lease_expires_at = _now()
     db.add(WorkerEvidence(
         execution_id=execution_id, worker_id=worker.worker_id, sequence=sequence,
         event_type="CLEANUP", failure_class=failure_class,
-        cleanup_verified=True, resource_usage={},
-        evidence_json={"source": "worker_report", "authoritative": False},
+        cleanup_verified=cleanup_verified, resource_usage={},
+        evidence_json={
+            "source": "worker_report", "authoritative": False,
+            "requested_final_status": final_status.value,
+        },
     ))
     db.add(_audit(
         event_type="WORKER_CLEANUP_REPORTED", actor_id=worker.worker_id,
         worker_id=worker.worker_id, execution_id=execution_id,
+        severity="WARNING" if not cleanup_verified else "INFO",
+        details={"reported_final_status": final_status.value,
+                 "cleanup_verified_claim": cleanup_verified},
+    ))
+    await db.commit()
+    return job
+
+
+async def finalize_execution_job(
+    db: AsyncSession, *, execution_id: uuid.UUID, final_status: ExecutionJobStatus,
+    actor_id: str,
+) -> WorkerExecutionJob:
+    """Trusted control-plane-only terminal transition after review of worker evidence."""
+    if final_status not in {ExecutionJobStatus.COMPLETED, ExecutionJobStatus.FAILED}:
+        raise WorkerProtocolError(422, "FINAL_STATUS_INVALID")
+    if not actor_id or len(actor_id) > 128:
+        raise WorkerProtocolError(422, "CONTROL_PLANE_ACTOR_INVALID")
+    job = (
+        await db.execute(
+            select(WorkerExecutionJob)
+            .where(WorkerExecutionJob.execution_id == execution_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise WorkerProtocolError(404, "EXECUTION_NOT_FOUND")
+    if job.status != ExecutionJobStatus.CLEANUP_REPORTED:
+        raise WorkerProtocolError(409, "CLEANUP_REPORT_REQUIRED")
+    job.status = final_status
+    job.lease_expires_at = _now()
+    db.add(_audit(
+        event_type="CONTROL_PLANE_EXECUTION_FINALIZED", actor_id=actor_id,
+        worker_id=job.assigned_worker_id, execution_id=execution_id,
         details={"final_status": final_status.value},
     ))
     await db.commit()

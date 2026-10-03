@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from app.models.worker import ExecutionFailureClass
 
@@ -24,6 +34,16 @@ class WorkerCapabilities(StrictModel):
     sandbox_version: StrictStr = Field(min_length=1, max_length=128)
     sandbox_digest: StrictStr = Field(pattern="^[0-9a-f]{64}$")
     protocol_versions: list[StrictStr] = Field(max_length=8)
+
+    @field_validator("protocol_versions")
+    @classmethod
+    def bound_protocol_versions(cls, values: list[str]) -> list[str]:
+        if any(not value or len(value.encode("utf-8")) > 64 for value in values):
+            raise ValueError("protocol version entries must be 1-64 UTF-8 bytes")
+        encoded = json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        if len(encoded) > 512:
+            raise ValueError("protocol metadata exceeds 512 bytes")
+        return values
 
 
 class WorkerEnrollmentIn(StrictModel):
@@ -122,6 +142,22 @@ class EvidenceIn(LeaseOperation):
     stderr_sha256: StrictStr | None = None
     protocol_violation: StrictStr | None = Field(default=None, max_length=64)
     sandbox_violation: StrictStr | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_untrusted_timeline(self):
+        # Worker clocks are untrusted. Enforce internal ordering only; recorded_at
+        # on the server remains the trusted chronology.
+        if any(
+            value is not None and value.tzinfo is None
+            for value in (self.started_at, self.ended_at)
+        ):
+            raise ValueError("worker telemetry timestamps must include a timezone")
+        if self.started_at is not None and self.ended_at is not None:
+            start = self.started_at
+            end = self.ended_at
+            if end < start:
+                raise ValueError("worker telemetry timestamps must be ordered")
+        return self
 
     @field_validator("stdout_sha256", "stderr_sha256")
     @classmethod

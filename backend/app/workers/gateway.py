@@ -40,6 +40,69 @@ from app.workers.service import (
 from app.workers.tls import WorkerGatewayTLSConfig, verified_peer_from_scope
 
 router = APIRouter(prefix="/worker/v1", tags=["worker-gateway"])
+MAX_WORKER_REQUEST_BYTES = 16 * 1024
+
+
+class WorkerRequestSizeLimit:
+    """Bound complete ASGI request bodies before protocol parsing."""
+
+    def __init__(self, app, *, max_bytes: int = MAX_WORKER_REQUEST_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not scope.get("path", "").startswith("/worker/"):
+            await self.app(scope, receive, send)
+            return
+        length = next(
+            (value for key, value in scope.get("headers", []) if key.lower() == b"content-length"),
+            None,
+        )
+        if length is not None:
+            try:
+                too_large = int(length) > self.max_bytes
+            except ValueError:
+                too_large = True
+            if too_large:
+                await self._reject(send)
+                return
+
+        chunks = []
+        total = 0
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            if total > self.max_bytes:
+                await self._reject(send)
+                return
+            chunks.append(chunk)
+            more = message.get("more_body", False)
+
+        body = b"".join(chunks)
+        delivered = False
+
+        async def replay_body():
+            nonlocal delivered
+            if not delivered:
+                delivered = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await self.app(scope, replay_body, send)
+
+    @staticmethod
+    async def _reject(send):
+        body = b'{"error":"REQUEST_TOO_LARGE"}'
+        await send({
+            "type": "http.response.start", "status": 413,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii"))],
+        })
+        await send({"type": "http.response.body", "body": body})
 
 
 async def get_worker_db(request: Request):
@@ -318,4 +381,5 @@ def create_worker_gateway_app():
     )
     app.include_router(router)
     install_worker_error_handler(app)
+    app.add_middleware(WorkerRequestSizeLimit)
     return app

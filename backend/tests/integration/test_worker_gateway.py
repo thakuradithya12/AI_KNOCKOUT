@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,6 +13,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from pydantic import ValidationError
 from sqlalchemy import insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,12 +37,14 @@ from app.models.worker import (
 )
 from app.workers.gateway import create_worker_gateway_app
 from app.workers.mock import MockArtifactRejected, MockWorker
-from app.workers.schemas import ResourcePolicy
+from app.workers.schemas import EvidenceIn, ResourcePolicy, WorkerCapabilities
 from app.workers.service import (
     WorkerProtocolError,
     activate_worker,
     authenticate_worker,
     create_execution_job,
+    enroll_worker,
+    finalize_execution_job,
     issue_certificate_rotation_token,
     issue_enrollment_token,
     revoke_worker,
@@ -636,13 +640,18 @@ async def test_scoped_artifact_capability_one_time_transfer_and_mock_digest_veri
         )
         assert observation.digest_verified
         assert observation.security_label == "MOCKED_DOES_NOT_PROVE_SANDBOX_SECURITY"
+        # Revocation fences subsequent requests. It cannot recall an already
+        # completed application-layer response buffer; no wire timing is implied.
+        transferred_bytes = transferred.content
+        await revoke_worker(db_session, worker_id=worker.worker_id, operator_id="operator-test")
+        assert transferred.content == transferred_bytes == fixture_bytes
         replay = await client.get(
             f"/worker/v1/jobs/{job.execution_id}/artifact",
             params={**common, "sequence": 4},
             headers={"X-Artifact-Capability": capability},
         )
         assert replay.status_code == 403
-        assert replay.json()["error"] == "ARTIFACT_CAPABILITY_EXHAUSTED"
+        assert replay.json()["error"] == "WORKER_NOT_ACTIVE"
     assert worker.worker_id == claimed["worker_id"]
     with pytest.raises(MockArtifactRejected, match="MOCK_FIXTURE_NOT_ALLOWLISTED"):
         MockWorker({}).verify_fixture(
@@ -1057,15 +1066,124 @@ async def test_cleanup_report_requires_verified_cleanup_and_finishes_mock_job(
             "lease_id": claimed["lease"]["lease_id"],
             "fencing_token": claimed["lease"]["fencing_token"],
         }
-        no_cleanup = await client.post(
+        report = await client.post(
             f"/worker/v1/jobs/{job.execution_id}/cleanup",
             json={**common, "sequence": 2, "cleanup_verified": False, "final_status": "COMPLETED"},
         )
-        assert no_cleanup.status_code == 409
-        assert no_cleanup.json()["error"] == "CLEANUP_NOT_VERIFIED"
-        # The failed cleanup makes the execution terminal; it cannot be reopened.
+        assert report.status_code == 200
+        assert report.json()["status"] == "CLEANUP_REPORTED"
         await db_session.refresh(job)
-        assert job.status == ExecutionJobStatus.FAILED
+        assert job.status == ExecutionJobStatus.CLEANUP_REPORTED
+        assert job.status != ExecutionJobStatus.COMPLETED
+        finalized = await finalize_execution_job(
+            db_session, execution_id=job.execution_id,
+            final_status=ExecutionJobStatus.COMPLETED, actor_id="trusted-control-plane",
+        )
+        assert finalized.status == ExecutionJobStatus.COMPLETED
+
+
+def test_worker_metadata_and_timestamp_bounds():
+    base = {
+        "sandbox_backend": "MOCK_TEST_ONLY", "sandbox_version": "mock/1",
+        "sandbox_digest": "a" * 64,
+    }
+    with pytest.raises(ValidationError):
+        WorkerCapabilities(**base, protocol_versions=["x" * 65])
+    with pytest.raises(ValidationError):
+        WorkerCapabilities(**base, protocol_versions=["v" * 64] * 8)
+    valid = WorkerCapabilities(**base, protocol_versions=["aik-jsonl/1"])
+    assert valid.protocol_versions == ["aik-jsonl/1"]
+    lease = {"lease_id": uuid.uuid4(), "fencing_token": 1, "sequence": 1}
+    with pytest.raises(ValidationError):
+        EvidenceIn(**lease, event_type="STARTED",
+                   started_at="2026-01-02T00:00:00+00:00",
+                   ended_at="2026-01-01T00:00:00+00:00")
+    with pytest.raises(ValidationError):
+        EvidenceIn(**lease, event_type="STARTED", started_at="2026-01-01T00:00:00")
+    # Distant time remains untrusted telemetry; server recorded_at is authoritative.
+    assert EvidenceIn(**lease, event_type="STARTED",
+                      started_at="2099-01-01T00:00:00+00:00").started_at.year == 2099
+
+
+def test_worker_database_role_migration_is_scoped():
+    migration = (
+        Path(__file__).parents[2]
+        / "migrations"
+        / "versions"
+        / "0005_worker_gateway_privileges.py"
+    ).read_text(encoding="utf-8")
+    assert "CREATE ROLE aik_worker_gateway NOLOGIN NOSUPERUSER NOCREATEDB" in migration
+    assert "NOCREATEROLE NOBYPASSRLS NOINHERIT" in migration
+    assert (
+        "GRANT SELECT ON submission_versions, quarantine_objects TO aik_worker_gateway"
+        in migration
+    )
+    assert "GRANT ALL" not in migration
+    assert "participants" not in migration
+    assert "participant_sessions" not in migration
+    assert "pg_has_role(session_user, 'aik_worker_gateway', 'member')" in migration
+
+
+@pytest.mark.asyncio
+async def test_rotation_authorization_is_single_use_and_revocable(db_session: AsyncSession):
+    worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+    now = datetime.now(timezone.utc)
+    worker = Worker(
+        worker_id=worker_id, status=WorkerStatus.ACTIVE,
+        certificate_fingerprint="a" * 64, expires_at=now + timedelta(days=10),
+        capabilities={}, security_state="UNREVIEWED",
+    )
+    db_session.add(worker)
+    await db_session.commit()
+    _, first = await issue_certificate_rotation_token(
+        db_session, worker_id=worker_id, approved_by="operator-test"
+    )
+    with pytest.raises(WorkerProtocolError, match="WORKER_ROTATION_TOKEN_OUTSTANDING"):
+        await issue_certificate_rotation_token(
+            db_session, worker_id=worker_id, approved_by="operator-test"
+        )
+    cert = VerifiedWorkerCertificate(
+        fingerprint="b" * 64, subject="CN=rotation", common_name="rotation",
+        worker_id=worker_id, serial="42", not_before=now - timedelta(minutes=1),
+        not_after=now + timedelta(days=30),
+    )
+    staged = await enroll_worker(
+        db_session, worker_id=worker_id, raw_token=first, certificate=cert,
+        capabilities=_capabilities(), software_version="test", runtime_version="test",
+    )
+    assert staged.pending_certificate_fingerprint == cert.fingerprint
+    active = await activate_worker(db_session, worker_id=worker_id, operator_id="operator-test")
+    assert active.certificate_fingerprint == cert.fingerprint
+    assert active.pending_certificate_fingerprint is None
+    with pytest.raises(WorkerProtocolError, match="ENROLLMENT_TOKEN_INVALID"):
+        await enroll_worker(
+            db_session, worker_id=worker_id, raw_token=first, certificate=cert,
+            capabilities=_capabilities(), software_version="test", runtime_version="test",
+        )
+    _, second = await issue_certificate_rotation_token(
+        db_session, worker_id=worker_id, approved_by="operator-test"
+    )
+    await revoke_worker(db_session, worker_id=worker_id, operator_id="operator-test")
+    second_hash = hashlib.sha256(second.encode()).hexdigest()
+    token = (await db_session.execute(
+        select(WorkerEnrollmentToken).where(
+            WorkerEnrollmentToken.token_hash == second_hash
+        )
+    )).scalar_one()
+    assert token.revoked_at is not None
+    with pytest.raises(WorkerProtocolError, match="ENROLLMENT_TOKEN_INVALID"):
+        await enroll_worker(
+            db_session, worker_id=worker_id, raw_token=second, certificate=cert,
+            capabilities=_capabilities(), software_version="test", runtime_version="test",
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_gateway_rejects_oversized_asgi_body(test_session_factory):
+    async with await _gateway_client(test_session_factory, None) as client:
+        response = await client.post("/worker/v1/enrollment", content=b"x" * (16 * 1024 + 1))
+    assert response.status_code == 413
+    assert response.json() == {"error": "REQUEST_TOO_LARGE"}
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1289,59 @@ def test_mtls_contexts_require_ca_and_client_identity(tmp_path, monkeypatch):
     assert client_context.verify_mode == 2  # ssl.CERT_REQUIRED
     assert client_context.check_hostname
     assert server_context.minimum_version >= 771  # TLS 1.2
+
+
+def test_hypercorn_listener_context_pins_tls12_and_requires_client_cert(monkeypatch):
+    import ssl
+    import sys
+    import types
+
+    class FakeConfig:
+        def __init__(self):
+            self.certfile = self.keyfile = self.ca_certs = None
+
+        def create_ssl_context(self):
+            return ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+
+    package = types.ModuleType("hypercorn")
+    package.__path__ = []
+    config_module = types.ModuleType("hypercorn.config")
+    config_module.Config = FakeConfig
+    logging_module = types.ModuleType("hypercorn.logging")
+
+    class FakeLogger:
+        messages = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def error(self, message, *args, **kwargs):
+            self.messages.append(message)
+
+        def warning(self, message, *args, **kwargs):
+            self.messages.append(message)
+
+    logging_module.Logger = FakeLogger
+    monkeypatch.setitem(sys.modules, "hypercorn", package)
+    monkeypatch.setitem(sys.modules, "hypercorn.config", config_module)
+    monkeypatch.setitem(sys.modules, "hypercorn.logging", logging_module)
+    from app.workers.serve import build_hypercorn_config
+
+    config = build_hypercorn_config(WorkerGatewayTLSConfig(
+        ca_certificate=Path("ca.pem"),
+        server_certificate=Path("server.pem"),
+        server_private_key=Path("server-key.pem"),
+        server_name="worker-gateway.test", bind_host="127.0.0.1", port=8443,
+    ))
+    context = config.create_ssl_context()
+    assert context.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert config.accesslog is None
+    assert config.insecure_bind == []
+    assert config.logger_class.__name__ == "BoundedWorkerLogger"
+    logger = config.logger_class()
+    logger.error("raw certificate and credential details must not be forwarded")
+    assert FakeLogger.messages[-1] == "WORKER_LISTENER_ERROR"
 
 
 @pytest.mark.asyncio
