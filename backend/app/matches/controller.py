@@ -38,7 +38,13 @@ class OutOfOrderMoveError(MatchControllerError):
     pass
 
 
+class MatchTranscriptCorruptedError(ValueError):
+    """Persisted match evidence failed deterministic replay; never repair it."""
+
+
 class RulesAdapter(Protocol):
+    def side_to_move(self, position: str, history: tuple[str, ...] = ()) -> str: ...
+
     def apply_legal_move(
         self, position: str, move_uci: str, history: tuple[str, ...]
     ) -> str | None:
@@ -277,7 +283,7 @@ class MatchController:
         current_ply: int,
         side_to_move: MatchSideColor,
         clock: MatchClock,
-        rules: RulesAdapter,
+        rules: RulesAdapter | None = None,
         transport: AIKTransport,
         monotonic,
         wall_clock=lambda: datetime.now(timezone.utc),
@@ -287,7 +293,7 @@ class MatchController:
     ) -> None:
         if set(sides) != {MatchSideColor.WHITE, MatchSideColor.BLACK}:
             raise ValueError("MATCH_REQUIRES_EXACTLY_TWO_SIDES")
-        if set(bindings) != set(sides):
+        if set(bindings) != set(sides) and not (state == MatchState.QUEUED and not bindings):
             raise ValueError("MATCH_REQUIRES_TWO_EXECUTION_BINDINGS")
         if current_ply < 0:
             raise ValueError("MATCH_PLY_INVALID")
@@ -313,6 +319,17 @@ class MatchController:
         self.current_ply = current_ply
         self.side_to_move = side_to_move
         self.clock = clock
+        if rules is None:
+            from app.matches.chess import ChessRulesAdapter
+
+            rules = ChessRulesAdapter(
+                configuration.initial_fen, rules_version=configuration.rules_version
+            )
+        adapter_initial = getattr(rules, "initial_position", configuration.initial_fen)
+        if configuration.initial_fen != adapter_initial:
+            raise ValueError("MATCH_INITIAL_POSITION_NOT_CANONICAL")
+        if current_ply == 0 and current_fen != adapter_initial:
+            raise ValueError("MATCH_INITIAL_POSITION_NOT_CANONICAL")
         self.rules = rules
         self.transport = transport
         self.monotonic = monotonic
@@ -340,17 +357,22 @@ class MatchController:
     def start(self, *, ready_execution_ids: set[uuid.UUID]) -> None:
         if self.state != MatchState.STARTING:
             raise InvalidMatchTransitionError("MATCH_NOT_STARTING")
+        if set(self.bindings) != set(self.sides):
+            raise InvalidMatchTransitionError("BOTH_EXECUTIONS_MUST_BE_BOUND")
         if ready_execution_ids != {binding.execution_id for binding in self.bindings.values()}:
             raise InvalidMatchTransitionError("BOTH_EXECUTIONS_MUST_BE_READY")
         self.state = MatchState.RUNNING
         self.started_at = self.wall_clock()
+        side_reader = getattr(self.rules, "side_to_move", None)
+        if side_reader is not None:
+            self.side_to_move = MatchSideColor(side_reader(self.current_fen, self.history))
         self.clock = MatchClock(
             self.clock.white_remaining_ms,
             self.clock.black_remaining_ms,
             self.clock.increment_ms,
-            MatchSideColor.WHITE,
+            self.side_to_move,
         )
-        self._event("MATCH_STARTED", "controller", {"first_side": "WHITE"})
+        self._event("MATCH_STARTED", "controller", {"first_side": self.side_to_move.value})
 
     def issue_new_game_request(self, *, side: MatchSideColor, request_id: str) -> AIKMessage:
         if self.state != MatchState.RUNNING or side not in self.sides:
@@ -584,6 +606,13 @@ class MatchController:
         if after is None:
             return self._abort(MatchFailure.ILLEGAL_MOVE, "ILLEGAL_MOVE")
         next_side = MatchSideColor.BLACK if side == MatchSideColor.WHITE else MatchSideColor.WHITE
+        next_history = (*self.history, move)
+        side_reader = getattr(self.rules, "side_to_move", None)
+        if side_reader is not None:
+            actual_next_side = MatchSideColor(side_reader(after, next_history))
+            if actual_next_side != next_side:
+                return self._abort(MatchFailure.SANDBOX_FAILURE, "RULES_SIDE_TO_MOVE_INCONSISTENT")
+            next_side = actual_next_side
         move_record = MatchMove(
             match_id=self.match_id,
             sequence=sequence,
@@ -603,7 +632,7 @@ class MatchController:
         self.current_ply = sequence
         self.current_fen = after
         self.side_to_move = next_side
-        self.history = (*self.history, move)
+        self.history = next_history
         self.clock = self.clock.after_move(elapsed, next_side)
         result = self.rules.terminal_result(after, self.history)
         self._request_id = None
@@ -724,11 +753,24 @@ class FakeRulesAdapter:
 
 
 def reconstruct_position(
-    initial_fen: str, moves: list[MatchMove], rules: RulesAdapter
+    initial_fen: str,
+    moves: list[MatchMove],
+    rules: RulesAdapter,
+    *,
+    sides: dict[MatchSideColor, MatchSideIdentity] | None = None,
+    bindings: dict[uuid.UUID, MatchExecutionBinding] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
+    adapter_initial = getattr(rules, "initial_position", initial_fen)
+    if initial_fen != adapter_initial:
+        raise ValueError("MATCH_INITIAL_POSITION_NOT_CANONICAL")
     position = initial_fen
     history: tuple[str, ...] = ()
-    expected_color = MatchSideColor.WHITE
+    side_reader = getattr(rules, "side_to_move", None)
+    expected_color = (
+        MatchSideColor(side_reader(position, history))
+        if side_reader is not None
+        else MatchSideColor.WHITE
+    )
     seen_requests: set[str] = set()
     for expected_sequence, move in enumerate(moves, start=1):
         if (
@@ -740,8 +782,26 @@ def reconstruct_position(
             or move.request_id in seen_requests
         ):
             raise ValueError("MATCH_TRANSCRIPT_SEQUENCE_OR_POSITION_INVALID")
+        if sides is not None or bindings is not None:
+            side = sides.get(move.color) if sides is not None else None
+            binding = (
+                bindings.get(move.execution_binding.binding_id) if bindings is not None else None
+            )
+            if (
+                side is None
+                or binding is None
+                or move.match_id != side.match_id
+                or move.side_id != side.side_id
+                or binding != move.execution_binding
+                or not binding.matches_side(side)
+            ):
+                raise ValueError("MATCH_TRANSCRIPT_BINDING_MISMATCH")
         next_position = rules.apply_legal_move(position, move.move_uci, history)
-        if next_position is None or position_identity(next_position) != move.position_after_sha256:
+        if (
+            next_position is None
+            or next_position != move.position_after_fen
+            or position_identity(next_position) != move.position_after_sha256
+        ):
             raise ValueError("MATCH_TRANSCRIPT_REPLAY_MISMATCH")
         position = next_position
         history = (*history, move.move_uci)
@@ -750,3 +810,100 @@ def reconstruct_position(
         )
         seen_requests.add(move.request_id)
     return position, history
+
+
+def rehydrate_controller(
+    *,
+    match_id: uuid.UUID,
+    state: MatchState,
+    sides: dict[MatchSideColor, MatchSideIdentity],
+    current_bindings: dict[MatchSideColor, MatchExecutionBinding],
+    historical_bindings: dict[uuid.UUID, MatchExecutionBinding],
+    configuration: MatchConfiguration,
+    accepted_moves: list[MatchMove],
+    persisted_fen: str,
+    persisted_ply: int,
+    persisted_side_to_move: MatchSideColor,
+    clock: MatchClock,
+    rules: RulesAdapter,
+    transport: AIKTransport,
+    monotonic,
+    result: MatchResult | None = None,
+    failure: MatchFailure | None = None,
+    started_at: datetime | None = None,
+    completed_at: datetime | None = None,
+    wall_clock=lambda: datetime.now(timezone.utc),
+) -> MatchController:
+    """Rebuild only a queued or terminal controller from verified durable evidence.
+
+    Active matches are not resumed: a process restart destroys the monotonic clock
+    deadline and must be recorded through record_controller_restart().
+    """
+    if state in {MatchState.STARTING, MatchState.RUNNING}:
+        raise MatchControllerError("ACTIVE_MATCH_RESTART_REQUIRES_ABORT")
+    if clock.turn_started_monotonic is not None or clock.move_deadline_monotonic is not None:
+        raise MatchControllerError("PERSISTED_MONOTONIC_DEADLINE_MUST_NOT_BE_RESTORED")
+    try:
+        position, history = reconstruct_position(
+            configuration.initial_fen,
+            accepted_moves,
+            rules,
+            sides=sides,
+            bindings=historical_bindings,
+        )
+    except (ValueError, MatchControllerError) as exc:
+        raise MatchTranscriptCorruptedError(str(exc)) from exc
+    if position != persisted_fen or len(history) != persisted_ply:
+        raise MatchTranscriptCorruptedError("MATCH_PERSISTED_SNAPSHOT_REPLAY_MISMATCH")
+    expected_side = rules.side_to_move(position, history)
+    if expected_side != persisted_side_to_move.value:
+        raise MatchTranscriptCorruptedError("MATCH_PERSISTED_SIDE_TO_MOVE_MISMATCH")
+    if state == MatchState.COMPLETED:
+        if result is None or failure is not None:
+            raise MatchTranscriptCorruptedError("MATCH_TERMINAL_RESULT_EVIDENCE_INVALID")
+        terminal = rules.terminal_result(position, history)
+        reason = result.reason.value
+        if terminal != (result.outcome, reason):
+            claim_reason = {
+                MatchResultReason.THREEFOLD_REPETITION: "threefold_repetition",
+                MatchResultReason.FIFTY_MOVE_RULE: "fifty_move_rule",
+            }.get(result.reason)
+            claimed = claim_reason is not None and rules.verify_draw_claim(
+                position, history, claim_reason, None
+            )
+            if not claimed or result.outcome != MatchOutcome.DRAW:
+                raise MatchTranscriptCorruptedError("MATCH_TERMINAL_RESULT_REPLAY_MISMATCH")
+    elif state == MatchState.ABORTED:
+        if failure is None or result is not None:
+            raise MatchTranscriptCorruptedError("MATCH_ABORT_EVIDENCE_INVALID")
+    elif state == MatchState.QUEUED:
+        if result is not None or failure is not None or accepted_moves:
+            raise MatchTranscriptCorruptedError("MATCH_QUEUED_EVIDENCE_INVALID")
+    else:
+        raise ValueError("MATCH_REHYDRATION_STATE_UNSUPPORTED")
+
+    controller = MatchController(
+        match_id=match_id,
+        state=state,
+        sides=sides,
+        bindings=current_bindings,
+        configuration=configuration,
+        current_fen=position,
+        current_ply=persisted_ply,
+        side_to_move=persisted_side_to_move,
+        clock=clock,
+        rules=rules,
+        transport=transport,
+        monotonic=monotonic,
+        wall_clock=wall_clock,
+        history=history,
+    )
+    controller.moves = list(accepted_moves)
+    controller.result = result
+    controller.failure = failure
+    controller.started_at = started_at
+    controller.completed_at = completed_at
+    controller.persisted_ply = persisted_ply
+    controller.persisted_state = state
+    controller.persisted_move_count = len(accepted_moves)
+    return controller

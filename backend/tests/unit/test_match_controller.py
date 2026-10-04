@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -41,7 +42,8 @@ class FakeTime:
 
 
 def make_controller(
-    *, transitions=None, terminal_positions=None, valid_draw_claims=None, clock_ms=10_000
+    *, transitions=None, terminal_positions=None, valid_draw_claims=None, clock_ms=10_000,
+    use_real_rules=False,
 ):
     timer = FakeTime()
     match_id = uuid.uuid4()
@@ -97,14 +99,15 @@ def make_controller(
         "aik-jsonl/1",
         "runtime-v1",
         "policy-v1",
-        "rules-v1",
-        "initial-position",
+        "standard-chess/python-chess-1.11.2" if use_real_rules else "rules-v1",
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        if use_real_rules else "initial-position",
         clock_ms,
         100,
         1_000,
         "c" * 64,
     )
-    rules = FakeRulesAdapter(
+    rules = None if use_real_rules else FakeRulesAdapter(
         transitions
         or {("initial-position", "e2e4"): "position-1", ("position-1", "e7e5"): "position-2"},
         terminal_positions=terminal_positions,
@@ -205,6 +208,24 @@ def test_accepted_move_is_server_authoritative_and_clocked():
     assert controller.side_to_move == MatchSideColor.BLACK
     assert controller.clock.white_remaining_ms == 9_975
     assert controller.events[-1].event_type == "MOVE_ACCEPTED"
+
+
+def test_production_controller_defaults_to_real_adapter_and_rejects_illegal_move():
+    from app.matches.chess import ChessRulesAdapter
+
+    controller, _ = make_controller(use_real_rules=True)
+    assert isinstance(controller.rules, ChessRulesAdapter)
+    issue(controller, MatchSideColor.WHITE, "request-real")
+    rejected = controller.receive_proposal(
+        side=MatchSideColor.WHITE,
+        binding=controller.bindings[MatchSideColor.WHITE],
+        sequence=1,
+        message=proposal("request-real", "e2e5"),
+    )
+    assert not rejected.accepted
+    assert controller.current_ply == 0
+    assert controller.current_fen == controller.configuration.initial_fen
+    assert controller.failure == MatchFailure.ILLEGAL_MOVE
 
 
 def test_illegal_move_aborts_without_inventing_chess_result():
@@ -424,3 +445,8 @@ def test_transcript_reconstruction_checks_hashes_order_and_alternating_sides():
     ]
     with pytest.raises(ValueError, match="MATCH_TRANSCRIPT_SEQUENCE_OR_POSITION_INVALID"):
         reconstruct_position("initial-position", corrupted, controller.rules)
+    corrupted_after_fen = replace(
+        controller.moves[0], position_after_fen="position-tampered"
+    )
+    with pytest.raises(ValueError, match="MATCH_TRANSCRIPT_REPLAY_MISMATCH"):
+        reconstruct_position("initial-position", [corrupted_after_fen], controller.rules)

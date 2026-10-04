@@ -171,11 +171,11 @@ def upgrade() -> None:
     DECLARE transition_reason text;
     BEGIN
       IF ROW(NEW.id, NEW.submission_id, NEW.participant_id, NEW.version, NEW.artifact_sha256,
-             NEW.artifact_size, NEW.storage_key, NEW.manifest, NEW.contract_version,
+             NEW.artifact_size, NEW.storage_key, NEW.manifest::jsonb, NEW.contract_version,
              NEW.protocol_version, NEW.runtime_profile, NEW.created_at)
          IS DISTINCT FROM
          ROW(OLD.id, OLD.submission_id, OLD.participant_id, OLD.version, OLD.artifact_sha256,
-             OLD.artifact_size, OLD.storage_key, OLD.manifest, OLD.contract_version,
+             OLD.artifact_size, OLD.storage_key, OLD.manifest::jsonb, OLD.contract_version,
              OLD.protocol_version, OLD.runtime_profile, OLD.created_at) THEN
         RAISE EXCEPTION 'submission version artifact identity is immutable' USING ERRCODE = 'check_violation';
       END IF;

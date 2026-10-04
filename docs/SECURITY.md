@@ -89,3 +89,15 @@ The following table records the security status when the Phase-1 baseline docume
 **IMPLEMENTED:** participant identity/authentication; submission and quarantine; mock-only worker control protocol; separate worker gateway; enrollment; certificate activation/rotation/revocation logic; execution-scoped artifact capabilities; leases/fencing; TLS configuration. Participant bearer credentials are rejected by the worker gateway. Worker private keys are not stored in PostgreSQL. Gateway startup requires `WORKER_DATABASE_URL` separately from the participant API database setting. Migration `0005` defines a `NOLOGIN` `aik_worker_gateway` privilege role with worker-table access and read-only access to the exact submission/quarantine tables needed for artifact transfer. Deployment must create a distinct login principal and grant membership; no credentials are created by the repository.
 
 **NOT VERIFIED:** real TLS handshake and certificate transport; deployed worker listener; deployment-applied PostgreSQL role grants; dedicated Linux/KVM worker; Kata; sandbox isolation. The Hypercorn listener entry point has an explicit TLS 1.2 minimum and mandatory client authentication in source, but is not deployed or handshake-verified. Tests use synthetic ASGI TLS identity and controlled fixture artifacts; they are **MOCKED — DOES NOT PROVE TLS OR SANDBOX SECURITY**. **PARTICIPANT EXECUTION: DISABLED.** No participant package was executed. Network, host filesystem, privilege, resource-limit, container escape, cross-execution and Kata isolation properties are **NOT VERIFIED — DEDICATED WORKER REQUIRED**. See `SECURE_EXECUTION_ENVIRONMENT_V1.md` for details.
+
+**MATCH RULES AND RECOVERY:** the controller defaults to the directly pinned
+`chess==1.11.2` rules adapter; participant output remains a move proposal, and
+the server validates and applies it. Transcript recovery checks legal replay,
+position digests, side identity, historical execution binding identity, stored
+position/ply/turn, and server-derived terminal results. Corrupt evidence is
+classified as `TRANSCRIPT_CORRUPTED` and the transactional recovery helper
+aborts an active match without rewriting its transcript. Active monotonic
+deadlines are never restored. PostgreSQL migration and trigger execution is
+**NOT VERIFIED** on this Windows sandbox: the installed PostgreSQL `initdb` and
+`pg_ctl` utilities could not create their restricted process tokens. No Docker,
+WSL, event database, event Redis, or `.env` workaround was used.

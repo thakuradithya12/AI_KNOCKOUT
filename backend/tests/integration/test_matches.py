@@ -30,11 +30,13 @@ from app.matches.service import (
     mark_execution_ready,
     mark_match_running,
     persist_controller_update,
+    record_transcript_corruption,
 )
 from app.models.competition import ArtifactState, CompetitionEvent
 from app.models.match import (
     Match,
     MatchExecutionBinding,
+    MatchFailure,
     MatchMove,
     MatchSide,
     MatchSideColor,
@@ -477,3 +479,40 @@ async def test_execution_binding_requires_exact_acknowledged_worker_jobs_and_rea
     await db_session.commit()
     with pytest.raises(MatchServiceError, match="EXECUTION_BINDING_STALE"):
         await persist_controller_update(db_session, controller)
+
+
+@pytest.mark.integration
+async def test_corrupt_transcript_recovery_aborts_without_changing_move_evidence(db_session):
+    match = Match(
+        id=uuid.uuid4(),
+        state=MatchState.QUEUED,
+        protocol_version="aik-jsonl/1",
+        runtime_profile="runtime-v1",
+        policy_version="policy-v1",
+        rules_version="rules-v1",
+        match_seed="e" * 64,
+        initial_fen="initial-position",
+        current_fen="initial-position",
+        side_to_move=MatchSideColor.WHITE,
+        current_ply=0,
+        initial_clock_ms=60_000,
+        increment_ms=0,
+        move_timeout_ms=5_000,
+        white_remaining_ms=60_000,
+        black_remaining_ms=60_000,
+        created_at=datetime.now(timezone.utc),
+    )
+    db_session.add(match)
+    await db_session.commit()
+
+    aborted = await record_transcript_corruption(db_session, match.id)
+    assert aborted.state == MatchState.ABORTED
+    assert aborted.failure_reason == MatchFailure.TRANSCRIPT_CORRUPTED.value
+    assert aborted.result_outcome is None and aborted.result_reason is None
+    event = await db_session.scalar(
+        select(CompetitionEvent).where(
+            CompetitionEvent.aggregate_id == match.id,
+            CompetitionEvent.event_type == "MATCH_ABORTED",
+        )
+    )
+    assert event.metadata_json["reason"] == "PERSISTED_TRANSCRIPT_REPLAY_FAILED"

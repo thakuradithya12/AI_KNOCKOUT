@@ -572,6 +572,41 @@ async def record_controller_restart(db: AsyncSession, match_id: uuid.UUID) -> Ma
     return match
 
 
+async def record_transcript_corruption(db: AsyncSession, match_id: uuid.UUID) -> Match:
+    """Abort an active match after replay evidence fails; never rewrite its transcript."""
+    match = await _locked_match(db, match_id)
+    if (
+        match.state == MatchState.ABORTED
+        and match.failure_reason == MatchFailure.TRANSCRIPT_CORRUPTED.value
+    ):
+        await db.commit()
+        return match
+    if match.state not in {MatchState.QUEUED, MatchState.STARTING, MatchState.RUNNING}:
+        raise MatchServiceError("MATCH_NOT_ACTIVE_FOR_CORRUPTION_ABORT")
+    now = _now()
+    match.state = MatchState.ABORTED
+    match.result_outcome = None
+    match.result_reason = None
+    match.failure_reason = MatchFailure.TRANSCRIPT_CORRUPTED.value
+    match.completed_at = now
+    db.add(
+        _event(
+            match_id=match.id,
+            sequence=await _next_event_sequence(db, match.id),
+            event_type="MATCH_ABORTED",
+            actor_id="match-controller",
+            recorded_at=now,
+            metadata={
+                "failure": MatchFailure.TRANSCRIPT_CORRUPTED.value,
+                "reason": "PERSISTED_TRANSCRIPT_REPLAY_FAILED",
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(match)
+    return match
+
+
 async def persist_controller_update(db: AsyncSession, controller) -> Match:
     """Atomically persist accepted controller state, move transcript, and outbox events."""
     match = await _locked_match(db, controller.match_id)

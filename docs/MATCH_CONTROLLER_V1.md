@@ -9,11 +9,10 @@ controller accepts a move only after checking the active side, exact execution
 binding, request identity, server sequence, deadline, protocol schema, and the
 configured rules adapter.
 
-This milestone creates the domain boundary and durable records. It does not
-launch participant processes or implement a chess rules engine. Tests use a
-deterministic fake transition table; this is not evidence of chess legality.
-The production rules adapter and actual Linux/KVM/Kata enforcement remain
-unimplemented.
+This milestone creates the domain boundary, durable records, and a production
+rules adapter. It does not launch participant processes. The deterministic fake
+transition table remains available only to tests that explicitly inject it.
+Actual Linux/KVM/Kata enforcement remains unimplemented.
 
 ## Pinned match identity
 
@@ -61,7 +60,7 @@ controller accepts only a response for its outstanding request. The existing bou
 `AIKTransport` rejects malformed or oversized JSONL, invalid move syntax,
 duplicate payloads, and participant result claims. The controller also rejects
 stale bindings, wrong side, duplicate/gapped sequence, late response, illegal
-fake-rule transition, and proposals after terminal state.
+rule transition, and proposals after terminal state.
 
 Accepted moves produce append-only `MatchMove` rows with server sequence, side,
 move, request ID, exact execution binding, before/after position hashes and
@@ -94,12 +93,27 @@ table and no spectator/WebSocket delivery.
 
 ## Recovery and current limitations
 
-Durable match configuration, exact sides, all execution attempts, accepted move
-transcript, current position/ply/side, remaining clocks, result/failure, and
-events are sufficient to audit and deterministically replay accepted moves when
-the real rules adapter is available. The pure replay helper checks sequence,
-alternating side, before-position identity, legality through the adapter, and
-after-position digest.
+The production controller defaults to `ChessRulesAdapter`, which uses the
+directly pinned `chess==1.11.2` (`python-chess`) package and requires the match
+configuration to pin `standard-chess/python-chess-1.11.2`. The controller sees
+only the typed `RulesAdapter` port. The adapter owns FEN encoding, UCI legality,
+position application, check/mate/stalemate, dead position, fivefold repetition,
+75-move automatic draws, and claimable threefold/50-move draws. It replays the
+full UCI transcript from the configured initial FEN for each operation, so
+repetition history is not lost when a position is serialized. This identifies
+a pinned library and its implemented rules surface; it is not a claim of
+exhaustive chess-rules certification.
+
+`rehydrate_controller` reconstructs a queued or terminal controller by replaying
+each accepted move through the rules port. It checks contiguous sequence,
+alternating side, exact before/after FEN and digest, move legality, exact side
+identity, historical execution binding identity/digest, persisted side-to-move,
+and a completed result. Any mismatch fails closed; it does not repair the
+transcript. A completed result based on a claimable draw is re-verified against
+the replayed position. Active `STARTING`/`RUNNING` records cannot be resumed:
+recovery must record `CONTROLLER_RESTART` and abort, because the monotonic
+deadline and handshake state cannot be reconstructed safely. Persisted
+remaining clocks are audit values, not a restarted deadline.
 
 An active controller restart is fail-closed: the match becomes `ABORTED` with
 `CONTROLLER_RESTART` and no chess result because a monotonic deadline cannot be
@@ -110,11 +124,11 @@ no cross-database concurrency claim is made here.
 
 ## Not implemented
 
-- Real chess rules implementation or legal move verification.
+- Real PostgreSQL migration/trigger verification against a disposable cluster.
 - Participant process launch, sandbox creation, resource/network/filesystem
   enforcement, or cleanup verification.
 - API endpoints that schedule matches or control executions.
 - Tournament scheduling, scoring, leaderboard, spectator, or frontend systems.
-- Real PostgreSQL trigger execution or Linux/KVM/Kata verification.
+- Linux/KVM/Kata verification.
 
 Participant-code execution remains disabled.

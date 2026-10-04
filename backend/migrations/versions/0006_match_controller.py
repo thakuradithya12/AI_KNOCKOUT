@@ -299,7 +299,7 @@ def upgrade() -> None:
              NEW.rules_version, NEW.match_seed, NEW.initial_fen, NEW.initial_clock_ms, NEW.increment_ms,
              NEW.move_timeout_ms, NEW.created_at) IS DISTINCT FROM
          ROW(OLD.id, OLD.protocol_version, OLD.runtime_profile, OLD.policy_version,
-             OLD.rules_version, OLD.initial_fen, OLD.initial_clock_ms, OLD.increment_ms,
+             OLD.rules_version, OLD.match_seed, OLD.initial_fen, OLD.initial_clock_ms, OLD.increment_ms,
              OLD.move_timeout_ms, OLD.created_at) THEN
         RAISE EXCEPTION 'match identity and configuration are immutable' USING ERRCODE = 'check_violation';
       END IF;
