@@ -82,3 +82,5 @@ quarantine/
 tmp/
 temp/
 scratch/
+
+.venv-verify/
