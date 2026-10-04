@@ -696,6 +696,10 @@ class AIKTransport:
     def set_deadline(self, deadline_monotonic: float) -> None:
         self._deadline = deadline_monotonic
 
+    def clear_deadline(self) -> None:
+        """Clear a previous turn deadline before setup/position synchronization."""
+        self._deadline = None
+
     def encode_controller_message(self, message_id: str, payload: dict) -> AIKMessage:
         self._check_deadline()
         if not message_id or len(message_id.encode("utf-8")) > 64:
