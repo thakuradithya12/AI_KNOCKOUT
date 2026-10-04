@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Request, status
@@ -28,6 +29,12 @@ logger = logging.getLogger("ai-knockout.submissions")
 router = APIRouter(prefix="/submissions", tags=["submissions"])
 
 
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _version_json(version: SubmissionVersion, *, duplicate: bool = False) -> dict:
     return {
         "id": str(version.id),
@@ -36,13 +43,15 @@ def _version_json(version: SubmissionVersion, *, duplicate: bool = False) -> dic
         "participant_id": version.participant_id,
         "artifact_sha256": version.artifact_sha256,
         "artifact_size": version.artifact_size,
+        "submitted_at": _utc(version.created_at),
+        "build_duration_seconds": version.build_duration_seconds,
         "manifest": version.manifest,
         "contract_version": version.contract_version,
         "protocol_version": version.protocol_version,
         "runtime_profile": version.runtime_profile,
         "state": version.state.value,
         "rejection_code": version.rejection_code,
-        "created_at": version.created_at,
+        "created_at": _utc(version.created_at),
         "duplicate": duplicate,
     }
 

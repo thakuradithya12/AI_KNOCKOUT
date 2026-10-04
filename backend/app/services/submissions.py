@@ -20,6 +20,7 @@ from app.models.competition import (
     ValidationAttempt,
     ValidationOutcome,
 )
+from app.models.event import BuildSession
 from app.services.quarantine_storage import quarantine_storage
 from app.services.submission_validation import (
     POLICY_VERSION,
@@ -61,6 +62,12 @@ class OrganizerApproval:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _manifest_field(manifest: dict | None, name: str) -> str | None:
@@ -212,6 +219,15 @@ async def accept_upload(
     if submission is None:
         raise LookupError("SUBMISSION_NOT_FOUND")
 
+    build_session = await db.scalar(
+        select(BuildSession)
+        .where(BuildSession.participant_id == participant_id)
+        .with_for_update()
+    )
+    if build_session is None:
+        raise LookupError("BUILD_SESSION_NOT_FOUND")
+    submitted_at = _now()
+
     digest = hashlib.sha256(archive_bytes).hexdigest()
     existing_version = (
         await db.execute(
@@ -265,6 +281,9 @@ async def accept_upload(
             )
         )
     ).scalar_one()
+    build_duration_seconds = max(
+        0, int((submitted_at - _utc(build_session.started_at)).total_seconds())
+    )
     version = SubmissionVersion(
         id=uuid.uuid4(),
         submission_id=submission_id,
@@ -272,6 +291,7 @@ async def accept_upload(
         version=(last_version or 0) + 1,
         artifact_sha256=digest,
         artifact_size=len(archive_bytes),
+        build_duration_seconds=build_duration_seconds,
         storage_key=storage_key,
         manifest=manifest,
         contract_version=_manifest_field(manifest, "contract_version"),
@@ -279,7 +299,7 @@ async def accept_upload(
         runtime_profile=_manifest_field(manifest, "runtime"),
         state=ArtifactState.QUARANTINED,
         rejection_code=None,
-        created_at=_now(),
+        created_at=submitted_at,
     )
     db.add(version)
     await db.flush()

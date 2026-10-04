@@ -27,6 +27,7 @@ from app.core.security import (
     generate_session_token,
     hash_token,
 )
+from app.models.event import BuildSession
 from app.models.participant import (
     AuthEvent,
     AuthEventType,
@@ -131,8 +132,18 @@ class AuthService:
             access_key_hash=access_key_hash,
             status=ParticipantStatus.ACTIVE,
         )
+        registered_at = datetime.now(timezone.utc)
+        participant.created_at = registered_at
         try:
             db.add(participant)
+            await db.flush()
+            db.add(
+                BuildSession(
+                    participant_id=participant_id,
+                    started_at=registered_at,
+                    start_source="REGISTRATION",
+                )
+            )
             await db.flush()
 
             # 5. Record audit event

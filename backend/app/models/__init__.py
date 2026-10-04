@@ -14,6 +14,7 @@ from app.models.competition import (
     ValidationAttempt,
     ValidationOutcome,
 )
+from app.models.event import BuildSession, EventControl, OfficialSubmissionSelection
 from app.models.match import (
     Match,
     MatchExecutionBinding,
@@ -76,4 +77,7 @@ __all__ = [
     "MatchFailure",
     "MatchExecutionBinding",
     "MatchMove",
+    "BuildSession",
+    "EventControl",
+    "OfficialSubmissionSelection",
 ]

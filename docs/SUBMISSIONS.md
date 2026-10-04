@@ -2,6 +2,8 @@
 
 **Historical scope of this submission-intake milestone:** it implements participant-owned submissions, immutable version metadata, exact-byte quarantine storage and static validation. That milestone did **not** implement participant-code execution, a sandbox, chess logic, matches, workers, tournament behavior or runtime eligibility. Worker-control-plane implementation is documented separately in `SECURE_EXECUTION_ENVIRONMENT_V1.md`; participant execution remains disabled.
 
+The event lifecycle addendum is authoritative in [AI Knockout Event Master Plan V1](AI_KNOCKOUT_EVENT_MASTER_PLAN.md). Registration now creates one immutable server-timestamped build session; each new version reuses its existing immutable `created_at` as receipt time and stores the server-calculated build duration. An eligible version may be separately selected as the intended official submission until the audited one-way freeze. These fields do not change artifact identity or validation/eligibility authority.
+
 ## Identity and records
 
 The existing authenticated participant session is the only identity source. Each logical submission has a server-generated UUID and immutable `participant_id` owner. Each uploaded digest creates an append-only positive version number. A repeated `(participant, submission, SHA-256)` upload returns the existing version and original validation attempt. New bytes create a new version; they do not replace earlier versions. Identical archive bytes from different owners reference one digest-addressed quarantine object while each owner gets distinct metadata.
@@ -14,6 +16,8 @@ The migration adds:
 - `validation_attempts`: append-only validator/policy version, times, outcome, bounded reason report.
 - `artifact_state_transitions`: append-only actor, source/target state, reason and correlation ID.
 - `competition_events`: transactionally written submission lifecycle event outbox records; this is separate from Phase 2 `auth_events`. No publisher, WebSocket, Redis queue or live event service is included.
+- `build_sessions`: one immutable start timestamp per participant. Existing participants are backfilled from their server-recorded registration timestamp.
+- `official_submission_selections` and `event_control`: current intended eligible version and one-way official-selection freeze. Freeze is available only as an internal trusted service operation until organizer authentication is implemented.
 
 PostgreSQL triggers reject updates/deletes to immutable artifact bytes, submission identity, validation attempts, transitions and competition events. They protect version identity columns and require a recorded, permitted transition for state changes. Portable SQLAlchemy flush guards enforce the same rules in isolated SQLite tests.
 

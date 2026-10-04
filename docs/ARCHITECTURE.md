@@ -2,6 +2,12 @@
 
 ## System Overview
 
+The event-level lifecycle and approval-gated policy decisions are specified in
+[AI Knockout Event Master Plan V1](AI_KNOCKOUT_EVENT_MASTER_PLAN.md). Build starts,
+submission receipt/duration, and official-submission freeze are server-owned;
+House AI execution, official tournament policy, admin controls, and spectator mode
+remain future work.
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │ Host Machine (Windows 11)                                │

@@ -11,6 +11,7 @@ const toast = document.querySelector("#toast");
 let sessionToken = null;
 let route = "login";
 let toastTimer;
+let buildClockTimer;
 
 function notify(message) {
   toast.textContent = message;
@@ -193,22 +194,26 @@ async function login(event) {
 
 function dashboard(participant) {
   route = "dashboard";
+  clearInterval(buildClockTimer);
+  buildClockTimer = null;
   app.innerHTML = `<section class="dashboard-head"><div><div class="section-index">AI KNOCKOUT <span>PARTICIPANT SYSTEM</span></div><h1 id="welcome">${esc(participant.name)}</h1><div class="identity-line"><span>Participant ID</span><code>${esc(participant.participant_id)}</code><span class="status-tag status-active">${esc(participant.status)}</span></div></div><div class="account-controls"><button class="button button-quiet" id="refresh" type="button">Refresh profile</button><button class="button button-quiet" data-signout type="button">Sign out</button></div></section>
     ${sectionNav("overview")}
     <section class="competition-state" aria-labelledby="competition-state-title">
       <div class="section-heading"><h2 id="competition-state-title">Current competition state</h2><span>Profile and service availability</span></div>
       <div class="competition-state-grid">
         <article class="state-card state-card-primary"><span class="state-label">Participant</span><strong><span class="status-tag status-active">${esc(participant.status)}</span></strong><p>Status from your participant profile.</p></article>
-        <article class="state-card"><span class="state-label">AI submission</span><strong class="unavailable">Unavailable</strong><p>Submission status is not exposed by this server.</p></article>
-        <article class="state-card"><span class="state-label">Validation</span><strong class="unavailable">Unavailable</strong><p>No validation state is available.</p></article>
-        <article class="state-card"><span class="state-label">Next match</span><strong class="unavailable">Unavailable</strong><p>The server does not expose match scheduling.</p></article>
+        <article class="state-card"><span class="state-label">Build session</span><strong id="build-elapsed" class="unavailable">Loading</strong><p id="build-started">Server clock loading</p></article>
+        <article class="state-card"><span class="state-label">Latest submission</span><strong id="submission-state" class="unavailable">Not submitted</strong><p id="submission-detail">No submission version is recorded.</p></article>
+        <article class="state-card"><span class="state-label">Validation</span><strong id="validation-state" class="unavailable">Not run</strong><p>Static validation status from the server.</p></article>
+        <article class="state-card"><span class="state-label">Development match</span><strong class="unavailable">Unavailable</strong><p>House AI match execution is not implemented.</p></article>
       </div>
     </section>
     <section class="overview-grid">
       <div class="overview-main">
         <section class="data-section services-section"><div class="section-heading"><h2>Competition services</h2><span>Availability</span></div>
-          <div class="service-row"><div><h3>Submissions & validation</h3><p>The server does not provide submission or validation endpoints yet.</p></div><span class="status-tag status-unavailable">Unavailable</span></div>
-          <div class="service-row"><div><h3>Matches & standings</h3><p>Scheduling, live game state, match history, and standings are not available.</p></div><span class="status-tag status-unavailable">Unavailable</span></div>
+          <div class="service-row"><div><h3>Submissions & validation</h3><p>Version history, static validation, eligibility, receipt time, and build duration are server-backed.</p></div><span class="status-tag status-active">Available</span></div>
+          <div class="service-row"><div><h3>Official submission</h3><p id="official-submission-detail">Selection status loading.</p><button class="button button-quiet hidden" id="select-official" type="button">Select latest eligible version</button></div><span class="status-tag status-unavailable" id="official-submission-state">Loading</span></div>
+          <div class="service-row"><div><h3>Development matches</h3><p>House AI identity is a future contract; match execution and development scoring are not implemented.</p></div><span class="status-tag status-unavailable">Unavailable</span></div>
         </section>
       </div>
       <aside class="identity-panel" aria-labelledby="identity-title"><div class="section-heading"><h2 id="identity-title">My AI</h2><span>Server identity</span></div>
@@ -219,7 +224,81 @@ function dashboard(participant) {
     <section class="activity-panel" aria-labelledby="activity-title"><div class="section-heading"><h2 id="activity-title">Recent activity</h2><span>Event timeline</span></div><div class="activity-empty"><span class="activity-mark" aria-hidden="true">—</span><div><strong>Activity data unavailable</strong><p>The server does not provide a participant activity or event timeline endpoint yet.</p></div></div></section>`;
   app.querySelector("#refresh").addEventListener("click", loadProfile);
   app.querySelector("[data-signout]").addEventListener("click", signOut);
+  app.querySelector("#select-official").addEventListener("click", selectLatestOfficial);
   bindSectionNav(participant);
+}
+
+function formatElapsed(totalSeconds) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function renderEventStatus(status) {
+  const elapsed = document.querySelector("#build-elapsed");
+  if (!elapsed) return;
+  const sampledAt = performance.now();
+  elapsed.textContent = formatElapsed(status.build_elapsed_seconds);
+  elapsed.classList.remove("unavailable");
+  const started = new Date(status.build_started_at);
+  document.querySelector("#build-started").textContent = `Started ${started.toLocaleString()} · server timestamp`;
+  buildClockTimer = setInterval(() => {
+    if (!document.querySelector("#build-elapsed")) return clearInterval(buildClockTimer);
+    elapsed.textContent = formatElapsed(status.build_elapsed_seconds + (performance.now() - sampledAt) / 1000);
+  }, 1000);
+
+  const latest = status.latest_submission;
+  const submission = document.querySelector("#submission-state");
+  const detail = document.querySelector("#submission-detail");
+  const validation = document.querySelector("#validation-state");
+  if (latest) {
+    submission.textContent = `Version ${latest.version} · ${latest.state}`;
+    submission.classList.remove("unavailable");
+    detail.textContent = `Received ${new Date(latest.submitted_at).toLocaleString()} · ${latest.build_duration_seconds ?? "—"}s build time`;
+    validation.textContent = latest.validation_outcome || "Pending";
+    validation.classList.remove("unavailable");
+  }
+
+  const officialTag = document.querySelector("#official-submission-state");
+  const officialDetail = document.querySelector("#official-submission-detail");
+  const selectButton = document.querySelector("#select-official");
+  if (status.official_frozen_at) {
+    officialTag.textContent = "Frozen";
+    officialDetail.textContent = status.official_submission
+      ? `Version ${status.official_submission.version} pinned at ${new Date(status.official_frozen_at).toLocaleString()}.`
+      : `Selection closed at ${new Date(status.official_frozen_at).toLocaleString()}.`;
+  } else if (status.official_submission) {
+    officialTag.textContent = "Selected";
+    officialDetail.textContent = `Version ${status.official_submission.version} is your intended official entry.`;
+    selectButton.textContent = "Update official version to latest eligible";
+    selectButton.classList.toggle("hidden", !latest || latest.state !== "ELIGIBLE");
+  } else {
+    officialTag.textContent = "Open";
+    officialDetail.textContent = "No official version selected. Only an eligible version can be selected.";
+    selectButton.textContent = "Select latest eligible version";
+    selectButton.classList.toggle("hidden", !latest || latest.state !== "ELIGIBLE");
+  }
+}
+
+async function selectLatestOfficial() {
+  const token = sessionToken;
+  if (!token) return landing("login");
+  try {
+    const status = await api.eventStatus(token);
+    if (!status.latest_submission || status.latest_submission.state !== "ELIGIBLE") return;
+    await api.selectOfficialSubmission(token, {
+      submission_id: status.latest_submission.submission_id,
+      version: status.latest_submission.version,
+    });
+    await loadProfile();
+    notify("Official submission selection updated");
+  } catch (error) {
+    if (error.status === 401 || error.status === 403) {
+      sessionToken = null;
+      landing("login", "Your session expired or was revoked. Sign in again.");
+    } else notify(error.message || "Could not update official submission");
+  }
 }
 
 const portalSections = [["overview", "Overview"], ["identity", "My AI"], ["submission", "Submissions"], ["matches", "Matches"], ["viewer", "Live match"], ["leaderboard", "Leaderboard"], ["history", "History"]];
@@ -227,7 +306,52 @@ function sectionNav(active) {
   return `<nav class="portal-nav" aria-label="Participant sections">${portalSections.map(([key, label]) => `<button type="button" class="portal-link ${key === active ? "selected" : ""}" data-section="${key}">${label}</button>`).join("")}</nav>`;
 }
 function bindSectionNav(participant) {
-  app.querySelectorAll("[data-section]").forEach(button => button.addEventListener("click", () => button.dataset.section === "overview" ? dashboard(participant) : unavailableSection(participant, button.dataset.section)));
+  app.querySelectorAll("[data-section]").forEach(button => button.addEventListener("click", () => {
+    if (button.dataset.section === "overview") dashboard(participant);
+    else if (button.dataset.section === "submission") participantSubmissions(participant);
+    else unavailableSection(participant, button.dataset.section);
+  }));
+}
+async function participantSubmissions(participant) {
+  route = "submission";
+  app.innerHTML = `<section class="dashboard-head"><div><div class="section-index">AI KNOCKOUT <span>SUBMISSIONS</span></div><h1>Submissions</h1><div class="identity-line"><span>${esc(participant.name)}</span><code>${esc(participant.participant_id)}</code></div></div><div class="account-controls"><button class="button button-quiet" id="refresh" type="button">Refresh profile</button><button class="button button-quiet" data-signout type="button">Sign out</button></div></section>${sectionNav("submission")}<section class="empty-state"><div class="empty-code">SERVER SUBMISSION STATE</div><h2 id="submission-heading">Loading latest version…</h2><p id="submission-copy">Loading server-recorded version, validation, build duration and official-selection state.</p><button class="button button-quiet hidden" id="select-official" type="button">Select latest eligible version</button></section>`;
+  app.querySelector("#refresh").addEventListener("click", loadProfile);
+  app.querySelector("[data-signout]").addEventListener("click", signOut);
+  bindSectionNav(participant);
+  try {
+    const status = await api.eventStatus(sessionToken);
+    const latest = status.latest_submission;
+    const heading = app.querySelector("#submission-heading");
+    const copy = app.querySelector("#submission-copy");
+    const button = app.querySelector("#select-official");
+    if (!latest) {
+      heading.textContent = "No submission received";
+      copy.textContent = "The server has not recorded an artifact version for this participant.";
+      return;
+    }
+    heading.textContent = `Version ${latest.version} · ${latest.state}`;
+    const official = status.official_submission
+      ? `Official selection: version ${status.official_submission.version}.`
+      : "No official version selected.";
+    const freeze = status.official_frozen_at ? ` Selection froze at ${new Date(status.official_frozen_at).toLocaleString()}.` : " Selection is open.";
+    copy.textContent = `Server received ${new Date(latest.submitted_at).toLocaleString()}; build duration ${latest.build_duration_seconds ?? "unavailable"} seconds. Validation: ${latest.validation_outcome || "pending"}. ${official}${freeze}`;
+    button.classList.toggle("hidden", latest.state !== "ELIGIBLE" || Boolean(status.official_frozen_at));
+    button.addEventListener("click", async () => {
+      try {
+        await api.selectOfficialSubmission(sessionToken, {
+          submission_id: latest.submission_id,
+          version: latest.version,
+        });
+        await participantSubmissions(participant);
+        notify("Official submission selection updated");
+      } catch (error) {
+        notify(error.message || "Could not update official submission");
+      }
+    });
+  } catch (error) {
+    app.querySelector("#submission-heading").textContent = "Submission state unavailable";
+    app.querySelector("#submission-copy").textContent = error.message || "Could not load server submission state.";
+  }
 }
 function unavailableSection(participant, section) {
   const sections = {
@@ -253,6 +377,17 @@ async function loadProfile() {
   try {
     const profile = await api.me(sessionToken);
     dashboard(profile);
+    try {
+      const eventStatus = await api.eventStatus(sessionToken);
+      renderEventStatus(eventStatus);
+    } catch (eventError) {
+      if (eventError.status === 401 || eventError.status === 403) throw eventError;
+      const elapsed = document.querySelector("#build-elapsed");
+      if (elapsed) elapsed.textContent = "Unavailable";
+      const started = document.querySelector("#build-started");
+      if (started) started.textContent = "Server event status could not be loaded.";
+      notify("Event status is temporarily unavailable.");
+    }
   } catch (error) {
     if (error.status === 401 || error.status === 403) {
       sessionToken = null;

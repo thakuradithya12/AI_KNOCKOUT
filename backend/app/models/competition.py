@@ -8,12 +8,25 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, ForeignKeyConstraint,
-    Integer, JSON, LargeBinary, String, UniqueConstraint, Uuid, event, func,
+    JSON,
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Integer,
+    LargeBinary,
+    String,
+    UniqueConstraint,
+    Uuid,
+    event,
+    func,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
+from app.models.event import BuildSession
 
 
 class ArtifactState(str, enum.Enum):
@@ -85,6 +98,10 @@ class SubmissionVersion(Base):
     __tablename__ = "submission_versions"
     __table_args__ = (
         UniqueConstraint("submission_id", "version", name="uq_submission_version_number"),
+        CheckConstraint(
+            "build_duration_seconds IS NULL OR build_duration_seconds >= 0",
+            name="ck_submission_build_duration_nonnegative",
+        ),
         ForeignKeyConstraint(
             ["submission_id", "participant_id"], ["submissions.id", "submissions.participant_id"],
             ondelete="RESTRICT", name="fk_submission_version_owner",
@@ -109,6 +126,8 @@ class SubmissionVersion(Base):
     contract_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     protocol_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     runtime_profile: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # NULL is reserved for legacy versions created before event timing existed.
+    build_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[ArtifactState] = mapped_column(
         Enum(ArtifactState, name="artifact_state", native_enum=False, length=32), nullable=False
     )
@@ -195,11 +214,11 @@ class CompetitionEvent(Base):
     )
 
 
-_IMMUTABLE_MODELS = (Submission, QuarantineObject, ValidationAttempt,
+_IMMUTABLE_MODELS = (BuildSession, Submission, QuarantineObject, ValidationAttempt,
                      ArtifactStateTransition, CompetitionEvent)
 _VERSION_IMMUTABLE_FIELDS = (
     "id", "submission_id", "participant_id", "version", "artifact_sha256",
-    "artifact_size", "storage_key", "manifest", "contract_version",
+    "artifact_size", "build_duration_seconds", "storage_key", "manifest", "contract_version",
     "protocol_version", "runtime_profile", "created_at",
 )
 

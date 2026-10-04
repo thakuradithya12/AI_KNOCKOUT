@@ -62,3 +62,27 @@ test("logout revokes the bearer token at the existing endpoint", async () => {
   try { assert.equal((await api.logout("opaque-session")).status, "ok"); }
   finally { restore(); }
 });
+
+test("event status and official selection use authenticated event contracts", async () => {
+  const seen = [];
+  const restore = mockFetch(async (url, options) => {
+    seen.push([url, options]);
+    return new Response(JSON.stringify({ official_frozen: false }), { status: 200 });
+  });
+  try {
+    await api.eventStatus("opaque-session");
+    await api.selectOfficialSubmission("opaque-session", {
+      submission_id: "00000000-0000-0000-0000-000000000001",
+      version: 2,
+    });
+    assert.equal(seen[0][0], "/api/v1/participants/me/event-status");
+    assert.equal(seen[0][1].headers.Authorization, "Bearer opaque-session");
+    assert.equal(seen[1][0], "/api/v1/participants/me/official-submission");
+    assert.equal(seen[1][1].method, "PUT");
+    assert.equal(seen[1][1].headers.Authorization, "Bearer opaque-session");
+    assert.deepEqual(JSON.parse(seen[1][1].body), {
+      submission_id: "00000000-0000-0000-0000-000000000001",
+      version: 2,
+    });
+  } finally { restore(); }
+});
