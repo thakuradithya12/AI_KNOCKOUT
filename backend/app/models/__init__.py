@@ -15,15 +15,20 @@ from app.models.competition import (
     ValidationOutcome,
 )
 from app.models.event import BuildSession, EventControl, OfficialSubmissionSelection
+from app.models.house_ai import HouseAI, HouseAIArtifact, HouseAIVersion
 from app.models.match import (
+    HouseAIMatchSideBinding,
     Match,
     MatchExecutionBinding,
     MatchFailure,
     MatchMove,
     MatchOutcome,
+    MatchPurpose,
     MatchSide,
     MatchSideColor,
+    MatchSideKind,
     MatchState,
+    ParticipantMatchSideBinding,
 )
 from app.models.participant import (
     AuthEvent,
@@ -36,6 +41,7 @@ from app.models.system import SystemInfo
 from app.models.worker import (
     ExecutionFailureClass,
     ExecutionJobStatus,
+    ExecutionKind,
     Worker,
     WorkerArtifactCapability,
     WorkerEnrollmentToken,
@@ -65,6 +71,7 @@ __all__ = [
     "WorkerEnrollmentToken",
     "WorkerExecutionJob",
     "ExecutionJobStatus",
+    "ExecutionKind",
     "ExecutionFailureClass",
     "WorkerArtifactCapability",
     "WorkerEvidence",
@@ -72,6 +79,10 @@ __all__ = [
     "Match",
     "MatchSide",
     "MatchSideColor",
+    "MatchSideKind",
+    "MatchPurpose",
+    "ParticipantMatchSideBinding",
+    "HouseAIMatchSideBinding",
     "MatchState",
     "MatchOutcome",
     "MatchFailure",
@@ -80,4 +91,7 @@ __all__ = [
     "BuildSession",
     "EventControl",
     "OfficialSubmissionSelection",
+    "HouseAI",
+    "HouseAIArtifact",
+    "HouseAIVersion",
 ]

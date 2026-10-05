@@ -13,9 +13,11 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     UniqueConstraint,
@@ -45,6 +47,11 @@ class ExecutionJobStatus(str, enum.Enum):
     FAILED = "FAILED"
     CANCELED = "CANCELED"
     EXPIRED = "EXPIRED"
+
+
+class ExecutionKind(str, enum.Enum):
+    PARTICIPANT = "PARTICIPANT"
+    HOUSE_AI = "HOUSE_AI"
 
 
 class ExecutionFailureClass(str, enum.Enum):
@@ -126,17 +133,53 @@ class WorkerExecutionJob(Base):
     __tablename__ = "worker_execution_jobs"
     __table_args__ = (
         UniqueConstraint("execution_id", name="uq_worker_job_execution"),
+        CheckConstraint(
+            "(execution_kind = 'PARTICIPANT' AND participant_id IS NOT NULL "
+            "AND submission_id IS NOT NULL AND submission_version IS NOT NULL "
+            "AND submission_version_id IS NOT NULL AND house_ai_id IS NULL "
+            "AND house_ai_version IS NULL) OR "
+            "(execution_kind = 'HOUSE_AI' AND participant_id IS NULL "
+            "AND submission_id IS NULL AND submission_version IS NULL "
+            "AND submission_version_id IS NULL AND house_ai_id IS NOT NULL "
+            "AND house_ai_version IS NOT NULL)",
+            name="ck_worker_job_subject_kind",
+        ),
+        CheckConstraint(
+            "submission_version IS NULL OR submission_version > 0",
+            name="ck_worker_job_version_positive",
+        ),
+        ForeignKeyConstraint(
+            ["submission_version_id", "participant_id", "submission_id", "artifact_sha256"],
+            ["submission_versions.id", "submission_versions.participant_id",
+             "submission_versions.submission_id", "submission_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_worker_job_participant_subject",
+        ),
+        ForeignKeyConstraint(
+            ["house_ai_id", "house_ai_version", "artifact_sha256"],
+            ["house_ai_versions.house_ai_id", "house_ai_versions.version",
+             "house_ai_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_worker_job_house_ai_subject",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     execution_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False, unique=True)
     match_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
-    participant_id: Mapped[str] = mapped_column(String(32), nullable=False)
-    submission_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    submission_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    submission_version_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=False
+    execution_kind: Mapped[ExecutionKind] = mapped_column(
+        Enum(ExecutionKind, native_enum=False, length=16),
+        nullable=False,
+        default=ExecutionKind.PARTICIPANT,
     )
+    participant_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    submission_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    submission_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    submission_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    house_ai_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    house_ai_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     immutable_artifact_ref: Mapped[str] = mapped_column(String(128), nullable=False)
     runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -263,6 +306,9 @@ def _guard_worker_records(session, flush_context, instances) -> None:
                 "submission_version", "submission_version_id", "artifact_sha256",
                 "immutable_artifact_ref", "runtime_profile", "protocol_version",
                 "execution_mode", "initial_state", "resource_policy", "execution_expires_at",
+                "execution_kind", "participant_id", "submission_id", "submission_version",
+                "submission_version_id", "house_ai_id", "house_ai_version",
+                "artifact_sha256", "immutable_artifact_ref",
             )
             if any(state.attrs[name].history.has_changes() for name in immutable):
                 raise ValueError("WORKER_JOB_IDENTITY_IMMUTABLE")

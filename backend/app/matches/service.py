@@ -20,14 +20,23 @@ from app.models.match import (
     Match,
     MatchFailure,
     MatchMove,
+    MatchPurpose,
     MatchSide,
     MatchSideColor,
+    MatchSideKind,
     MatchState,
+    ParticipantMatchSideBinding,
 )
 from app.models.match import (
     MatchExecutionBinding as MatchExecutionBindingRecord,
 )
-from app.models.worker import ExecutionJobStatus, Worker, WorkerExecutionJob, WorkerStatus
+from app.models.worker import (
+    ExecutionJobStatus,
+    ExecutionKind,
+    Worker,
+    WorkerExecutionJob,
+    WorkerStatus,
+)
 from app.services.quarantine_storage import quarantine_storage
 
 
@@ -154,10 +163,7 @@ async def create_match(
             id=uuid.uuid4(),
             match_id=match.id,
             color=MatchSideColor.WHITE,
-            participant_id=white.participant_id,
-            submission_id=white.submission_id,
-            submission_version_id=white.id,
-            artifact_sha256=white.artifact_sha256,
+            kind=MatchSideKind.PARTICIPANT,
             protocol_version=configuration.protocol_version,
             runtime_profile=configuration.runtime_profile,
             created_at=now,
@@ -166,18 +172,34 @@ async def create_match(
             id=uuid.uuid4(),
             match_id=match.id,
             color=MatchSideColor.BLACK,
-            participant_id=black.participant_id,
-            submission_id=black.submission_id,
-            submission_version_id=black.id,
-            artifact_sha256=black.artifact_sha256,
+            kind=MatchSideKind.PARTICIPANT,
             protocol_version=configuration.protocol_version,
             runtime_profile=configuration.runtime_profile,
             created_at=now,
         ),
     )
+    side_bindings = (
+        ParticipantMatchSideBinding(
+            match_side_id=sides[0].id,
+            participant_id=white.participant_id,
+            submission_id=white.submission_id,
+            submission_version_id=white.id,
+            artifact_sha256=white.artifact_sha256,
+        ),
+        ParticipantMatchSideBinding(
+            match_side_id=sides[1].id,
+            participant_id=black.participant_id,
+            submission_id=black.submission_id,
+            submission_version_id=black.id,
+            artifact_sha256=black.artifact_sha256,
+        ),
+    )
+    sides[0].participant_binding = side_bindings[0]
+    sides[1].participant_binding = side_bindings[1]
     db.add(match)
     await db.flush()
     db.add_all(sides)
+    db.add_all(side_bindings)
     await db.flush()
     db.add(
         _event(
@@ -210,6 +232,22 @@ async def begin_initialization(db: AsyncSession, match_id: uuid.UUID) -> Match:
         return match
     if match.state != MatchState.QUEUED:
         raise MatchServiceError("MATCH_NOT_QUEUED")
+    sides = (
+        (await db.execute(select(MatchSide).where(MatchSide.match_id == match.id)))
+        .scalars()
+        .all()
+    )
+    kinds = [side.kind for side in sides]
+    if len(sides) != 2 or (
+        match.purpose in {MatchPurpose.PEER_TEST, MatchPurpose.OFFICIAL}
+        and set(kinds) != {MatchSideKind.PARTICIPANT}
+    ) or (
+        match.purpose == MatchPurpose.DEVELOPMENT
+        and sorted(kind.value for kind in kinds) != sorted(
+            [MatchSideKind.PARTICIPANT.value, MatchSideKind.HOUSE_AI.value]
+        )
+    ):
+        raise MatchServiceError("MATCH_PURPOSE_SIDE_COMPOSITION_INVALID")
     match.state = MatchState.STARTING
     now = _now()
     db.add(
@@ -252,6 +290,14 @@ async def bind_execution(
             or existing.worker_id != worker_id
             or existing.lease_id != lease_id
             or existing.fencing_token != fencing_token
+            or existing.execution_kind != side.kind
+            or existing.submission_version_id
+            != (side.submission_version_id if side.kind == MatchSideKind.PARTICIPANT else None)
+            or existing.house_ai_id
+            != (side.house_ai_binding.house_ai_id if side.house_ai_binding else None)
+            or existing.house_ai_version
+            != (side.house_ai_binding.house_ai_version if side.house_ai_binding else None)
+            or existing.artifact_sha256 != side.artifact_sha256
         ):
             raise MatchServiceError("EXECUTION_BINDING_REPLAY_MISMATCH")
         await db.commit()
@@ -266,6 +312,9 @@ async def bind_execution(
             lease_id=existing.lease_id,
             fencing_token=existing.fencing_token,
             attempt_number=existing.attempt_number,
+            kind=existing.execution_kind,
+            house_ai_id=existing.house_ai_id,
+            house_ai_version=existing.house_ai_version,
         )
     if match.state != MatchState.STARTING:
         raise MatchServiceError("MATCH_NOT_INITIALIZING")
@@ -283,13 +332,26 @@ async def bind_execution(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    subject_matches = False
+    if job is not None and side.kind == MatchSideKind.PARTICIPANT:
+        subject_matches = (
+            job.execution_kind == ExecutionKind.PARTICIPANT
+            and job.submission_version_id == side.submission_version_id
+            and job.submission_id == side.submission_id
+            and job.participant_id == side.participant_id
+            and job.artifact_sha256 == side.artifact_sha256
+        )
+    elif job is not None and side.kind == MatchSideKind.HOUSE_AI and side.house_ai_binding:
+        subject_matches = (
+            job.execution_kind == ExecutionKind.HOUSE_AI
+            and job.house_ai_id == side.house_ai_binding.house_ai_id
+            and job.house_ai_version == side.house_ai_binding.house_ai_version
+            and job.artifact_sha256 == side.artifact_sha256
+        )
     if (
         job is None
         or job.match_id != match.id
-        or job.submission_version_id != side.submission_version_id
-        or job.submission_id != side.submission_id
-        or job.artifact_sha256 != side.artifact_sha256
-        or job.participant_id != side.participant_id
+        or not subject_matches
         or job.protocol_version != side.protocol_version
         or job.runtime_profile != side.runtime_profile
         or job.assigned_worker_id != worker_id
@@ -312,7 +374,14 @@ async def bind_execution(
         match_side_id=side.id,
         attempt_number=(latest or 0) + 1,
         execution_id=execution_id,
-        submission_version_id=side.submission_version_id,
+        execution_kind=side.kind,
+        submission_version_id=(
+            side.submission_version_id if side.kind == MatchSideKind.PARTICIPANT else None
+        ),
+        house_ai_id=side.house_ai_binding.house_ai_id if side.house_ai_binding else None,
+        house_ai_version=(
+            side.house_ai_binding.house_ai_version if side.house_ai_binding else None
+        ),
         artifact_sha256=side.artifact_sha256,
         worker_id=worker_id,
         lease_id=lease_id,
@@ -332,7 +401,14 @@ async def bind_execution(
                 "side_id": str(side.id),
                 "execution_id": str(execution_id),
                 "attempt_number": row.attempt_number,
-                "submission_version_id": str(side.submission_version_id),
+                "execution_kind": side.kind.value,
+                "submission_version_id": (
+                    str(side.submission_version_id)
+                    if side.submission_version_id is not None
+                    else None
+                ),
+                "house_ai_id": row.house_ai_id,
+                "house_ai_version": row.house_ai_version,
                 "artifact_sha256": side.artifact_sha256,
             },
         )
@@ -349,6 +425,9 @@ async def bind_execution(
         lease_id=row.lease_id,
         fencing_token=row.fencing_token,
         attempt_number=row.attempt_number,
+        kind=row.execution_kind,
+        house_ai_id=row.house_ai_id,
+        house_ai_version=row.house_ai_version,
     )
 
 
@@ -482,13 +561,22 @@ async def _current_binding(
         row.match_id != binding.match_id
         or row.match_side_id != binding.side_id
         or row.execution_id != binding.execution_id
+        or row.execution_kind != binding.kind
         or row.submission_version_id != binding.submission_version_id
+        or row.house_ai_id != binding.house_ai_id
+        or row.house_ai_version != binding.house_ai_version
         or row.artifact_sha256 != binding.artifact_digest
         or row.worker_id != binding.worker_id
         or row.lease_id != binding.lease_id
         or row.fencing_token != binding.fencing_token
     ):
         return None
+    side = await db.get(MatchSide, row.match_side_id)
+    worker = (
+        await db.execute(select(Worker).where(Worker.worker_id == row.worker_id).with_for_update())
+    ).scalar_one_or_none()
+    # Match worker revocation's lock order (worker before its active jobs).
+    # This avoids a job/worker lock inversion during concurrent revocation.
     job = (
         await db.execute(
             select(WorkerExecutionJob)
@@ -496,10 +584,26 @@ async def _current_binding(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    side = await db.get(MatchSide, row.match_side_id)
-    worker = (
-        await db.execute(select(Worker).where(Worker.worker_id == row.worker_id).with_for_update())
-    ).scalar_one_or_none()
+    subject_matches = False
+    if side is not None and side.kind == MatchSideKind.PARTICIPANT:
+        subject_matches = (
+            job is not None
+            and job.execution_kind == ExecutionKind.PARTICIPANT
+            and job.participant_id == side.participant_id
+            and job.submission_id == side.submission_id
+            and job.submission_version_id == row.submission_version_id
+            and job.artifact_sha256 == row.artifact_sha256
+        )
+    elif side is not None and side.kind == MatchSideKind.HOUSE_AI and side.house_ai_binding:
+        subject_matches = (
+            job is not None
+            and job.execution_kind == ExecutionKind.HOUSE_AI
+            and job.house_ai_id == side.house_ai_binding.house_ai_id
+            and job.house_ai_version == side.house_ai_binding.house_ai_version
+            and row.house_ai_id == side.house_ai_binding.house_ai_id
+            and row.house_ai_version == side.house_ai_binding.house_ai_version
+            and job.artifact_sha256 == row.artifact_sha256
+        )
     if (
         job is None
         or side is None
@@ -510,10 +614,7 @@ async def _current_binding(
         or job.assigned_worker_id != row.worker_id
         or job.lease_id != row.lease_id
         or job.match_id != row.match_id
-        or job.participant_id != side.participant_id
-        or job.submission_id != side.submission_id
-        or job.submission_version_id != row.submission_version_id
-        or job.artifact_sha256 != row.artifact_sha256
+        or not subject_matches
         or job.protocol_version != side.protocol_version
         or job.runtime_profile != side.runtime_profile
         or job.fencing_token != row.fencing_token
@@ -537,6 +638,9 @@ def _binding_value(row: MatchExecutionBindingRecord) -> MatchExecutionBinding:
         lease_id=row.lease_id,
         fencing_token=row.fencing_token,
         attempt_number=row.attempt_number,
+        kind=row.execution_kind,
+        house_ai_id=row.house_ai_id,
+        house_ai_version=row.house_ai_version,
     )
 
 

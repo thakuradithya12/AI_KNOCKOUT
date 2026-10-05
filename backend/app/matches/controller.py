@@ -14,7 +14,13 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Protocol
 
-from app.models.match import MatchFailure, MatchOutcome, MatchSideColor, MatchState
+from app.models.match import (
+    MatchFailure,
+    MatchOutcome,
+    MatchSideColor,
+    MatchSideKind,
+    MatchState,
+)
 from app.sandbox.contract import AIKMessage, AIKProtocolError, AIKTransport
 
 
@@ -95,18 +101,48 @@ class MatchSideIdentity:
     side_id: uuid.UUID
     match_id: uuid.UUID
     color: MatchSideColor
-    participant_id: str
-    submission_id: uuid.UUID
-    submission_version_id: uuid.UUID
+    participant_id: str | None
+    submission_id: uuid.UUID | None
+    submission_version_id: uuid.UUID | None
     artifact_digest: str
     protocol_version: str
     runtime_profile: str
+    kind: MatchSideKind = MatchSideKind.PARTICIPANT
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", self.artifact_digest):
             raise ValueError("MATCH_SIDE_DIGEST_INVALID")
-        if not self.participant_id or not self.protocol_version or not self.runtime_profile:
+        participant_identity = (
+            self.participant_id is not None
+            and self.submission_id is not None
+            and self.submission_version_id is not None
+            and self.house_ai_id is None
+            and self.house_ai_version is None
+        )
+        house_identity = (
+            self.participant_id is None
+            and self.submission_id is None
+            and self.submission_version_id is None
+            and bool(self.house_ai_id)
+            and self.house_ai_version is not None
+            and self.house_ai_version > 0
+        )
+        if (
+            self.kind not in {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI}
+            or (self.kind == MatchSideKind.PARTICIPANT and not participant_identity)
+            or (self.kind == MatchSideKind.HOUSE_AI and not house_identity)
+            or not self.protocol_version
+            or not self.runtime_profile
+        ):
             raise ValueError("MATCH_SIDE_IDENTITY_INVALID")
+
+    @property
+    def actor_identity(self) -> tuple:
+        if self.kind == MatchSideKind.PARTICIPANT:
+            return (self.kind, self.participant_id)
+        return (self.kind, self.house_ai_id, self.house_ai_version)
 
 
 @dataclass(frozen=True)
@@ -115,24 +151,48 @@ class MatchExecutionBinding:
     match_id: uuid.UUID
     side_id: uuid.UUID
     execution_id: uuid.UUID
-    submission_version_id: uuid.UUID
+    submission_version_id: uuid.UUID | None
     artifact_digest: str
     worker_id: str
     lease_id: uuid.UUID
     fencing_token: int
     attempt_number: int
+    kind: MatchSideKind = MatchSideKind.PARTICIPANT
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", self.artifact_digest):
             raise ValueError("EXECUTION_BINDING_DIGEST_INVALID")
-        if not self.worker_id or self.fencing_token < 1 or self.attempt_number < 1:
+        if (
+            not self.worker_id
+            or self.fencing_token < 1
+            or self.attempt_number < 1
+            or self.kind not in {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI}
+            or (self.kind == MatchSideKind.PARTICIPANT and (self.submission_version_id is None or self.house_ai_id is not None or self.house_ai_version is not None))
+            or (
+                self.kind == MatchSideKind.HOUSE_AI
+                and (
+                    self.submission_version_id is not None
+                    or not self.house_ai_id
+                    or self.house_ai_version is None
+                    or self.house_ai_version < 1
+                )
+            )
+        ):
             raise ValueError("EXECUTION_BINDING_IDENTITY_INVALID")
 
     def matches_side(self, side: MatchSideIdentity) -> bool:
         return (
             self.match_id == side.match_id
             and self.side_id == side.side_id
-            and self.submission_version_id == side.submission_version_id
+            and self.kind == side.kind
+            and (
+                self.submission_version_id == side.submission_version_id
+                if side.kind == MatchSideKind.PARTICIPANT
+                else self.house_ai_id == side.house_ai_id
+                and self.house_ai_version == side.house_ai_version
+            )
             and self.artifact_digest == side.artifact_digest
         )
 
@@ -297,8 +357,8 @@ class MatchController:
             raise ValueError("MATCH_REQUIRES_TWO_EXECUTION_BINDINGS")
         if current_ply < 0:
             raise ValueError("MATCH_PLY_INVALID")
-        if sides[MatchSideColor.WHITE].participant_id == sides[MatchSideColor.BLACK].participant_id:
-            raise ValueError("SELF_MATCH_NOT_ALLOWED")
+        if sides[MatchSideColor.WHITE].actor_identity == sides[MatchSideColor.BLACK].actor_identity:
+            raise ValueError("DUPLICATE_MATCH_SIDE_IDENTITY")
         for color, side in sides.items():
             if (
                 side.match_id != match_id

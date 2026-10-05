@@ -98,6 +98,10 @@ class SubmissionVersion(Base):
     __tablename__ = "submission_versions"
     __table_args__ = (
         UniqueConstraint("submission_id", "version", name="uq_submission_version_number"),
+        UniqueConstraint(
+            "id", "participant_id", "submission_id", "artifact_sha256",
+            name="uq_submission_version_exact_identity",
+        ),
         CheckConstraint(
             "build_duration_seconds IS NULL OR build_duration_seconds >= 0",
             name="ck_submission_build_duration_nonnegative",

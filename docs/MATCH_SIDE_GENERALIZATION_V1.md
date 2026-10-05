@@ -1,9 +1,10 @@
 # Match Side Generalization V1: Participant and House AI
 
-**Status:** Design proposal for implementation review. No House AI match, queue,
-execution, or portal capability is implemented by this document. Existing
-participant-versus-participant behavior remains the only supported persisted
-match form until a later implementation and verification milestone.
+**Status:** Typed side and execution-subject durable foundation implemented in
+migration `0008_typed_match_sides`. This does not implement House AI gameplay,
+match creation, worker queueing, artifact transfer, or portal capability. Only
+participant-versus-participant matches can currently be created through the
+supported service path. PostgreSQL migration verification remains required.
 
 ## 1. Current architecture
 
@@ -16,17 +17,20 @@ transcript and lifecycle evidence. `MatchController` owns protocol sequencing,
 clocks, legality through `ChessRulesAdapter`, terminal outcomes, and failure
 classification.
 
-Today, each `MatchSide` is a participant side. `create_match()` accepts two
+Before migration 0008, each `MatchSide` was a participant side. `create_match()` accepts two
 different eligible participant versions and verifies both quarantine objects.
 The worker job and artifact capability are likewise participant-submission
 specific. Readiness and transition to RUNNING require two current worker
 execution bindings and their readiness evidence. The participant portal has no
 development-match API and accurately reports this capability unavailable.
 
-There is no generic `Execution` table, no House AI artifact inventory, no House
-AI worker identity, and no House AI runtime or participant sandbox. The worker
-gateway is a control-plane protocol, not evidence that a participant sandbox
-has run.
+There is no generic `Execution` table, no House AI worker identity, and no House
+AI runtime or participant sandbox. Migration 0008 adds organizer-owned House AI
+identity, version and digest-addressed artifact-reference records, typed match
+side bindings, and a discriminated subject on the existing worker job and match
+execution binding. The worker gateway remains a control-plane protocol, not
+evidence that a participant sandbox has run. House AI jobs are not yet queued,
+claimed, staged or executed.
 
 ## 2. Exact blocker analysis
 
@@ -93,8 +97,10 @@ Side composition is purpose constrained:
 
 - `DEVELOPMENT`: exactly one `PARTICIPANT` and one `HOUSE_AI`.
 - `OFFICIAL`: exactly two distinct `PARTICIPANT` sides, each bound to an
-  eligible frozen official version when official tournament creation is later
-  implemented.
+  eligible version that exactly matches that participant's selected version
+  after `event_control.official_freeze_at` is set. PostgreSQL verifies this
+  binding when an official match enters `STARTING`; an arbitrary eligible
+  version cannot be labeled official.
 - Existing participant-versus-participant records retain their current meaning;
   adding purpose must not imply that old records are official tournament
   records. Backfill legacy rows to an explicit compatibility purpose such as
@@ -158,9 +164,14 @@ house_ai_artifacts
   content-addressed object metadata, digest, size
 ```
 
-The composite `(house_ai_id, version)` is the immutable version identity.
-`runtime_identity_sha256` pins the organizer runtime/build identity separately
-from the profile name; the policy version/digest identifies behavior. Foreign
+The composite `(house_ai_id, version)` is the immutable version identity and
+the authoritative record for its runtime and policy digests. A match pins that
+version through its typed side binding and artifact digest, and checks the
+version's protocol, runtime profile, rules version and policy version against
+the match configuration. It does not duplicate `runtime_identity_sha256` or
+`policy_digest` on the match row. `runtime_identity_sha256` pins the organizer
+runtime/build identity separately from the profile name; the policy
+version/digest identifies behavior. Foreign
 keys bind each artifact record, match-side binding and execution target to that
 version. Digests use lowercase SHA-256 hex and are verified over the exact bytes
 when registered, staged and consumed. Update means create a new version; never

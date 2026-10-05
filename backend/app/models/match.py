@@ -12,13 +12,14 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     UniqueConstraint,
     Uuid,
     event,
 )
-from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from app.db.base import Base
 
@@ -34,6 +35,17 @@ class MatchState(str, enum.Enum):
 class MatchSideColor(str, enum.Enum):
     WHITE = "WHITE"
     BLACK = "BLACK"
+
+
+class MatchSideKind(str, enum.Enum):
+    PARTICIPANT = "PARTICIPANT"
+    HOUSE_AI = "HOUSE_AI"
+
+
+class MatchPurpose(str, enum.Enum):
+    PEER_TEST = "PEER_TEST"
+    DEVELOPMENT = "DEVELOPMENT"
+    OFFICIAL = "OFFICIAL"
 
 
 class MatchOutcome(str, enum.Enum):
@@ -74,6 +86,29 @@ class Match(Base):
             "state IN ('QUEUED','STARTING','RUNNING','COMPLETED','ABORTED')",
             name="ck_matches_state",
         ),
+        CheckConstraint(
+            "purpose IN ('PEER_TEST','DEVELOPMENT','OFFICIAL')",
+            name="ck_matches_purpose",
+        ),
+        CheckConstraint(
+            "(purpose = 'DEVELOPMENT' AND idempotency_participant_id IS NOT NULL "
+            "AND idempotency_key IS NOT NULL AND request_hash IS NOT NULL) OR "
+            "(purpose <> 'DEVELOPMENT' AND idempotency_participant_id IS NULL "
+            "AND idempotency_key IS NULL AND request_hash IS NULL)",
+            name="ck_match_idempotency_purpose",
+        ),
+        CheckConstraint(
+            "request_hash IS NULL OR length(request_hash) = 64",
+            name="ck_match_request_hash_length",
+        ),
+        CheckConstraint(
+            "idempotency_key IS NULL OR length(idempotency_key) BETWEEN 1 AND 128",
+            name="ck_match_idempotency_key_length",
+        ),
+        UniqueConstraint(
+            "idempotency_participant_id", "idempotency_key",
+            name="uq_match_participant_idempotency_key",
+        ),
         CheckConstraint("current_ply >= 0", name="ck_matches_ply_nonnegative"),
         CheckConstraint("side_to_move IN ('WHITE','BLACK')", name="ck_matches_side_to_move"),
         CheckConstraint("length(match_seed) = 64", name="ck_matches_seed_length"),
@@ -113,6 +148,16 @@ class Match(Base):
     state: Mapped[MatchState] = mapped_column(
         Enum(MatchState, native_enum=False, length=16), nullable=False
     )
+    purpose: Mapped[MatchPurpose] = mapped_column(
+        Enum(MatchPurpose, native_enum=False, length=16),
+        nullable=False,
+        default=MatchPurpose.PEER_TEST,
+    )
+    idempotency_participant_id: Mapped[str | None] = mapped_column(
+        ForeignKey("participants.participant_id", ondelete="RESTRICT"), nullable=True
+    )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
     runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -141,9 +186,8 @@ class MatchSide(Base):
     __tablename__ = "match_sides"
     __table_args__ = (
         UniqueConstraint("match_id", "color", name="uq_match_sides_color"),
-        UniqueConstraint("match_id", "participant_id", name="uq_match_sides_participant"),
         CheckConstraint("color IN ('WHITE','BLACK')", name="ck_match_sides_color"),
-        CheckConstraint("length(artifact_sha256) = 64", name="ck_match_side_sha256"),
+        CheckConstraint("kind IN ('PARTICIPANT','HOUSE_AI')", name="ck_match_sides_kind"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -153,6 +197,62 @@ class MatchSide(Base):
     color: Mapped[MatchSideColor] = mapped_column(
         Enum(MatchSideColor, native_enum=False, length=8), nullable=False
     )
+    kind: Mapped[MatchSideKind] = mapped_column(
+        Enum(MatchSideKind, native_enum=False, length=16), nullable=False
+    )
+    protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    participant_binding: Mapped[ParticipantMatchSideBinding | None] = relationship(
+        back_populates="side", uselist=False, lazy="joined"
+    )
+    house_ai_binding: Mapped[HouseAIMatchSideBinding | None] = relationship(
+        back_populates="side", uselist=False, lazy="joined"
+    )
+
+    @property
+    def participant_id(self) -> str | None:
+        return self.participant_binding.participant_id if self.participant_binding else None
+
+    @property
+    def submission_id(self) -> uuid.UUID | None:
+        return self.participant_binding.submission_id if self.participant_binding else None
+
+    @property
+    def submission_version_id(self) -> uuid.UUID | None:
+        return self.participant_binding.submission_version_id if self.participant_binding else None
+
+    @property
+    def artifact_sha256(self) -> str:
+        if self.participant_binding:
+            return self.participant_binding.artifact_sha256
+        if self.house_ai_binding:
+            return self.house_ai_binding.artifact_sha256
+        raise ValueError("MATCH_SIDE_IDENTITY_MISSING")
+
+
+class ParticipantMatchSideBinding(Base):
+    __tablename__ = "participant_match_side_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "match_side_id", "participant_id", name="uq_participant_side_identity"
+        ),
+        UniqueConstraint(
+            "match_side_id", "submission_version_id", "artifact_sha256",
+            name="uq_participant_side_artifact",
+        ),
+        ForeignKeyConstraint(
+            ["submission_version_id", "participant_id", "submission_id", "artifact_sha256"],
+            ["submission_versions.id", "submission_versions.participant_id",
+             "submission_versions.submission_id", "submission_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_participant_side_exact_version",
+        ),
+    )
+
+    match_side_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("match_sides.id", ondelete="RESTRICT"), primary_key=True
+    )
     participant_id: Mapped[str] = mapped_column(
         ForeignKey("participants.participant_id", ondelete="RESTRICT"), nullable=False
     )
@@ -160,12 +260,31 @@ class MatchSide(Base):
         ForeignKey("submissions.id", ondelete="RESTRICT"), nullable=False
     )
     submission_version_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=False
+        nullable=False
     )
     artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
-    runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    side: Mapped[MatchSide] = relationship(back_populates="participant_binding")
+
+
+class HouseAIMatchSideBinding(Base):
+    __tablename__ = "house_ai_match_side_bindings"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["house_ai_id", "house_ai_version", "artifact_sha256"],
+            ["house_ai_versions.house_ai_id", "house_ai_versions.version",
+             "house_ai_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_house_side_exact_version",
+        ),
+    )
+
+    match_side_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("match_sides.id", ondelete="RESTRICT"), primary_key=True
+    )
+    house_ai_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    house_ai_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[MatchSide] = relationship(back_populates="house_ai_binding")
 
 
 class MatchExecutionBinding(Base):
@@ -176,9 +295,28 @@ class MatchExecutionBinding(Base):
         CheckConstraint("attempt_number > 0", name="ck_match_execution_attempt_positive"),
         CheckConstraint("fencing_token > 0", name="ck_match_execution_fence_positive"),
         CheckConstraint("length(artifact_sha256) = 64", name="ck_match_execution_sha256"),
+        CheckConstraint(
+            "(execution_kind = 'PARTICIPANT' AND submission_version_id IS NOT NULL "
+            "AND house_ai_id IS NULL AND house_ai_version IS NULL) OR "
+            "(execution_kind = 'HOUSE_AI' AND submission_version_id IS NULL "
+            "AND house_ai_id IS NOT NULL AND house_ai_version IS NOT NULL)",
+            name="ck_match_execution_subject_kind",
+        ),
+        ForeignKeyConstraint(
+            ["house_ai_id", "house_ai_version", "artifact_sha256"],
+            ["house_ai_versions.house_ai_id", "house_ai_versions.version",
+             "house_ai_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_match_execution_house_ai_subject",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    execution_kind: Mapped[MatchSideKind] = mapped_column(
+        Enum(MatchSideKind, native_enum=False, length=16),
+        nullable=False,
+        default=MatchSideKind.PARTICIPANT,
+    )
     match_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("matches.id", ondelete="RESTRICT"), nullable=False, index=True
     )
@@ -187,9 +325,11 @@ class MatchExecutionBinding(Base):
     )
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     execution_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    submission_version_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=False
+    submission_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=True
     )
+    house_ai_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    house_ai_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     worker_id: Mapped[str] = mapped_column(
         ForeignKey("workers.worker_id", ondelete="RESTRICT"), nullable=False
@@ -230,7 +370,13 @@ class MatchMove(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
-_IMMUTABLE_MATCH_MODELS = (MatchSide, MatchExecutionBinding, MatchMove)
+_IMMUTABLE_MATCH_MODELS = (
+    MatchSide,
+    ParticipantMatchSideBinding,
+    HouseAIMatchSideBinding,
+    MatchExecutionBinding,
+    MatchMove,
+)
 _MATCH_CONFIG_FIELDS = {
     "id",
     "protocol_version",
@@ -243,6 +389,10 @@ _MATCH_CONFIG_FIELDS = {
     "increment_ms",
     "move_timeout_ms",
     "created_at",
+    "purpose",
+    "idempotency_participant_id",
+    "idempotency_key",
+    "request_hash",
 }
 _MATCH_MUTABLE_FIELDS = {
     "state",
@@ -261,6 +411,23 @@ _MATCH_MUTABLE_FIELDS = {
 
 @event.listens_for(Session, "before_flush")
 def enforce_match_immutability(session: Session, _flush_context, _instances) -> None:
+    for side in session.new:
+        if not isinstance(side, MatchSide):
+            continue
+        participant_binding = side.participant_binding
+        house_binding = side.house_ai_binding
+        participant_present = participant_binding is not None or any(
+            isinstance(row, ParticipantMatchSideBinding) and row.match_side_id == side.id
+            for row in session.new
+        )
+        house_present = house_binding is not None or any(
+            isinstance(row, HouseAIMatchSideBinding) and row.match_side_id == side.id
+            for row in session.new
+        )
+        if (side.kind == MatchSideKind.PARTICIPANT and not participant_present) or (
+            side.kind == MatchSideKind.HOUSE_AI and not house_present
+        ) or participant_present == house_present:
+            raise ValueError("MATCH_SIDE_TYPED_IDENTITY_INVALID")
     for obj in session.new:
         if isinstance(obj, Match) and obj.state != MatchState.QUEUED:
             raise ValueError("MATCH_MUST_START_QUEUED")

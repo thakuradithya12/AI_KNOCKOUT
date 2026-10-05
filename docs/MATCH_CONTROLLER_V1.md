@@ -1,9 +1,10 @@
 # Match Controller V1
 
-The current persisted side contract is participant-versus-participant. A
-design-only proposal for typed participant and House AI sides is recorded in
-[`MATCH_SIDE_GENERALIZATION_V1.md`](MATCH_SIDE_GENERALIZATION_V1.md); it does
-not change the supported match types or authorize House AI/participant execution.
+The durable side schema supports typed `PARTICIPANT` and `HOUSE_AI` identities,
+and the worker job / match execution binding schema has a typed execution
+subject. The supported match creation and execution path remains
+participant-versus-participant only. This foundation does not authorize House
+AI gameplay, queueing, artifact transfer, or participant-code execution.
 
 ## Authority and scope
 
@@ -33,20 +34,31 @@ QUEUED -> STARTING -> RUNNING -> COMPLETED
    +----------+----------+-> ABORTED
 ```
 
-`MatchSide` has one WHITE and one BLACK record. Each immutable side pins
-participant ID, submission ID, submission-version ID, exact SHA-256 digest,
-protocol, and runtime profile. Match creation accepts version IDs only, requires
+`MatchSide` has one WHITE and one BLACK record with exactly one typed identity
+binding. Participant sides pin participant ID, submission ID, submission-version
+ID and exact SHA-256 digest. House AI sides can pin a frozen House AI version
+and digest at the schema boundary, but no supported service currently creates
+such a match. Participant match creation accepts version IDs only, requires
 both versions to be eligible, verifies exact quarantined bytes against the
 stored digest, and rejects self-match. It never accepts participant-supplied
 artifact bytes and never enqueues execution.
 
+The database rejects a participant occupying both sides of `PEER_TEST` and
+`OFFICIAL` matches. `OFFICIAL` can enter `STARTING` only after the one-way
+event freeze and only when both side bindings exactly match the frozen
+`official_submission_selections`; this does not add an official tournament
+creation or scheduling path. A House AI version row is immutable authority for
+its runtime identity and policy digests; the match binds the version and
+artifact digest and checks its compatibility fields without duplicating those
+digests on `matches`.
+
 ## Execution binding and readiness
 
 `MatchExecutionBinding` append-only rows bind a match side to an execution,
-worker, lease, fencing token, attempt, exact version, and digest. Binding requires
-an acknowledged worker execution job with matching match/side participant,
-submission, version, digest, protocol/runtime, worker, lease, fence, and live
-expiry. The current binding must remain the latest attempt and its worker/job
+worker, lease, fencing token, attempt, typed subject and digest. Binding requires
+an acknowledged worker execution job whose subject agrees with the side; the
+currently supported worker service still creates and claims participant jobs
+only. The current binding must remain the latest attempt and its worker/job
 must remain active when readiness is recorded. A match enters `RUNNING` only
 after each exact current binding has a durable `EXECUTION_READY` event.
 

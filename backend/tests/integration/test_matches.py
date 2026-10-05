@@ -40,7 +40,9 @@ from app.models.match import (
     MatchMove,
     MatchSide,
     MatchSideColor,
+    MatchSideKind,
     MatchState,
+    ParticipantMatchSideBinding,
 )
 from app.models.worker import (
     ExecutionJobStatus,
@@ -138,23 +140,28 @@ async def test_match_creation_pins_two_exact_eligible_versions_and_event(
 
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
+            duplicate_side_id = uuid.uuid4()
             db_session.add(
                 MatchSide(
-                    id=uuid.uuid4(),
+                    id=duplicate_side_id,
                     match_id=match.id,
                     color=sides[0].color,
-                    participant_id=sides[0].participant_id,
-                    submission_id=sides[0].submission_id,
-                    submission_version_id=sides[0].submission_version_id,
-                    artifact_sha256=sides[0].artifact_sha256,
+                    kind=MatchSideKind.PARTICIPANT,
                     protocol_version=sides[0].protocol_version,
                     runtime_profile=sides[0].runtime_profile,
                     created_at=sides[0].created_at,
+                    participant_binding=ParticipantMatchSideBinding(
+                        match_side_id=duplicate_side_id,
+                        participant_id=sides[0].participant_id,
+                        submission_id=sides[0].submission_id,
+                        submission_version_id=sides[0].submission_version_id,
+                        artifact_sha256=sides[0].artifact_sha256,
+                    ),
                 )
             )
             await db_session.flush()
 
-    sides[0].artifact_sha256 = "0" * 64
+    sides[0].participant_binding.artifact_sha256 = "0" * 64
     with pytest.raises(ValueError, match="MATCH_APPEND_ONLY_RECORD_IMMUTABLE"):
         await db_session.flush()
     await db_session.rollback()

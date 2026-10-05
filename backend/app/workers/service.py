@@ -16,6 +16,7 @@ from app.models.competition import ArtifactState, QuarantineObject, SubmissionVe
 from app.models.worker import (
     ExecutionFailureClass,
     ExecutionJobStatus,
+    ExecutionKind,
     Worker,
     WorkerArtifactCapability,
     WorkerEnrollmentToken,
@@ -395,6 +396,7 @@ async def create_execution_job(
     job = WorkerExecutionJob(
         execution_id=uuid.uuid4(),
         match_id=match_id,
+        execution_kind=ExecutionKind.PARTICIPANT,
         participant_id=version.participant_id,
         submission_id=version.submission_id,
         submission_version=version.version,
@@ -459,6 +461,7 @@ async def claim_job(
             select(WorkerExecutionJob)
             .where(
                 WorkerExecutionJob.execution_expires_at > now,
+                WorkerExecutionJob.execution_kind == ExecutionKind.PARTICIPANT,
                 (
                     (WorkerExecutionJob.status == ExecutionJobStatus.QUEUED)
                     | (
@@ -564,6 +567,8 @@ async def issue_artifact_capability(
         db, worker=worker, execution_id=execution_id, lease_id=lease_id,
         fencing_token=fencing_token,
     )
+    if job.execution_kind != ExecutionKind.PARTICIPANT:
+        raise WorkerProtocolError(403, "EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
     _next_sequence(job, sequence, {"op": "artifact_capability"})
     if job.status != ExecutionJobStatus.ACKNOWLEDGED:
         raise WorkerProtocolError(409, "JOB_NOT_ACKNOWLEDGED")
@@ -602,6 +607,8 @@ async def download_authorized_artifact(
         db, worker=worker, execution_id=execution_id, lease_id=lease_id,
         fencing_token=fencing_token,
     )
+    if job.execution_kind != ExecutionKind.PARTICIPANT:
+        raise WorkerProtocolError(403, "EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
     cap = (
         await db.execute(
             select(WorkerArtifactCapability)

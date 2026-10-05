@@ -149,6 +149,18 @@ All timestamps stored in the database and emitted in logs use **UTC**. The Postg
 
 Worker protocol code lives in a separate ASGI application and listener entry point (`backend/app/workers/gateway.py`, `backend/app/workers/serve.py`). It is not mounted in the participant API and is not a Compose service. Enrollment and certificate lifecycle logic, TLS configuration, execution-scoped artifact capabilities, and lease/fencing are implemented. The listener has not been deployed or tested with a real TLS handshake. The current protocol is mock-only; no participant package is executed. Dedicated Linux/KVM, Kata, sandbox isolation, chess execution and match/tournament services are not implemented or verified.
 
+## Current match identity foundation
+
+Migration `0008_typed_match_sides` introduces one `Match` aggregate with typed
+participant or House AI side identity records, immutable House AI identity and
+version/artifact-reference tables, and typed execution subjects on the existing
+worker job and match execution binding. Existing participant-versus-participant
+match creation remains the only supported service path. House AI gameplay,
+development-match creation/queueing, House AI artifact transfer, participant
+execution, portal features and tournament integration remain unimplemented.
+The migration and database trigger behavior require disposable PostgreSQL
+verification; SQLite tests do not prove those database invariants.
+
 ## Original Phase-1 Extension Points (historical)
 
 Future phases will add:
