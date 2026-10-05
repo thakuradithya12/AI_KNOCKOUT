@@ -1,5 +1,10 @@
 # Match Controller V1
 
+The current persisted side contract is participant-versus-participant. A
+design-only proposal for typed participant and House AI sides is recorded in
+[`MATCH_SIDE_GENERALIZATION_V1.md`](MATCH_SIDE_GENERALIZATION_V1.md); it does
+not change the supported match types or authorize House AI/participant execution.
+
 ## Authority and scope
 
 The match controller is trusted control-plane logic. A participant process can
