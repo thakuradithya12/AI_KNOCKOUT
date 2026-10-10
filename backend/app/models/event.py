@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -13,8 +16,9 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Uuid,
+    event,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base
 
@@ -50,6 +54,40 @@ class EventControl(Base):
     official_freeze_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     official_freeze_actor_id: Mapped[str | None] = mapped_column(String(64))
     official_freeze_reason: Mapped[str | None] = mapped_column(String(64))
+
+
+class DevelopmentMatchPolicy(Base):
+    """Immutable, content-digested policy snapshot used by development matches."""
+
+    __tablename__ = "development_match_policies"
+    __table_args__ = (
+        CheckConstraint("length(policy_digest) = 64", name="ck_development_policy_digest"),
+        UniqueConstraint(
+            "policy_id", "version", "policy_digest",
+            name="uq_development_policy_digest_identity",
+        ),
+    )
+
+    policy_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    version: Mapped[str] = mapped_column(String(32), primary_key=True)
+    policy_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    policy_document: Mapped[dict] = mapped_column(JSON, nullable=False)
+    frozen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+@event.listens_for(Session, "before_flush")
+def enforce_development_policy_immutability(session, _flush_context, _instances) -> None:
+    for row in session.new:
+        if isinstance(row, DevelopmentMatchPolicy):
+            canonical = json.dumps(
+                row.policy_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            if hashlib.sha256(canonical).hexdigest() != row.policy_digest:
+                raise ValueError("DEVELOPMENT_POLICY_DIGEST_INVALID")
+    if any(isinstance(row, DevelopmentMatchPolicy) for row in session.dirty):
+        raise ValueError("DEVELOPMENT_POLICY_IMMUTABLE")
+    if any(isinstance(row, DevelopmentMatchPolicy) for row in session.deleted):
+        raise ValueError("DEVELOPMENT_POLICY_CANNOT_BE_DELETED")
 
 
 class OfficialSubmissionSelection(Base):

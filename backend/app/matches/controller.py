@@ -76,6 +76,8 @@ class MatchConfiguration:
     increment_ms: int
     move_timeout_ms: int
     match_seed: str
+    policy_id: str | None = None
+    policy_digest: str | None = None
 
     def __post_init__(self) -> None:
         if self.protocol_version != "aik-jsonl/1":
@@ -86,6 +88,10 @@ class MatchConfiguration:
                 raise ValueError(f"MATCH_{name.upper()}_INVALID")
         if not re.fullmatch(r"[0-9a-f]{64}", self.match_seed):
             raise ValueError("MATCH_SEED_INVALID")
+        if self.policy_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", self.policy_digest):
+            raise ValueError("MATCH_POLICY_DIGEST_INVALID")
+        if (self.policy_id is None) != (self.policy_digest is None):
+            raise ValueError("MATCH_POLICY_IDENTITY_INVALID")
         if not self.initial_fen or len(self.initial_fen.encode("utf-8")) > 256:
             raise ValueError("MATCH_INITIAL_POSITION_INVALID")
         if not 1 <= self.initial_clock_ms <= 3_600_000:
@@ -169,7 +175,14 @@ class MatchExecutionBinding:
             or self.fencing_token < 1
             or self.attempt_number < 1
             or self.kind not in {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI}
-            or (self.kind == MatchSideKind.PARTICIPANT and (self.submission_version_id is None or self.house_ai_id is not None or self.house_ai_version is not None))
+            or (
+                self.kind == MatchSideKind.PARTICIPANT
+                and (
+                    self.submission_version_id is None
+                    or self.house_ai_id is not None
+                    or self.house_ai_version is not None
+                )
+            )
             or (
                 self.kind == MatchSideKind.HOUSE_AI
                 and (

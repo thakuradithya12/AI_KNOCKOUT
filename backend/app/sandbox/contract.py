@@ -73,6 +73,11 @@ class ExecutionState(str, Enum):
     DESTROYED = "DESTROYED"
 
 
+class ExecutionSubjectKind(str, Enum):
+    PARTICIPANT = "PARTICIPANT"
+    HOUSE_AI = "HOUSE_AI"
+
+
 class FailureClass(str, Enum):
     STARTUP_FAILURE = "STARTUP_FAILURE"
     MOVE_TIMEOUT = "MOVE_TIMEOUT"
@@ -120,7 +125,7 @@ _ALLOWED: dict[ExecutionState, set[ExecutionState]] = {
 @dataclass(frozen=True)
 class ExecutionIdentity:
     execution_id: uuid.UUID
-    submission_version_id: uuid.UUID
+    submission_version_id: uuid.UUID | None
     artifact_digest: str
     policy_profile: str
     runtime_profile: str
@@ -129,6 +134,12 @@ class ExecutionIdentity:
     fencing_token: int
     protocol_version: str
     lease_expires_at: datetime
+    subject_kind: ExecutionSubjectKind = ExecutionSubjectKind.PARTICIPANT
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
+    match_id: uuid.UUID | None = None
+    policy_digest: str | None = None
+    sandbox_policy_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[0-9a-f]{64}", self.artifact_digest):
@@ -141,6 +152,27 @@ class ExecutionIdentity:
                 raise ValueError(f"{name.upper()}_INVALID")
         if self.lease_expires_at.tzinfo is None:
             raise ValueError("LEASE_EXPIRY_MUST_BE_TIMEZONE_AWARE")
+        if self.policy_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", self.policy_digest):
+            raise ValueError("POLICY_DIGEST_INVALID")
+        if self.sandbox_policy_digest is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.sandbox_policy_digest
+        ):
+            raise ValueError("SANDBOX_POLICY_DIGEST_INVALID")
+        participant = (
+            self.subject_kind == ExecutionSubjectKind.PARTICIPANT
+            and self.submission_version_id is not None
+            and self.house_ai_id is None
+            and self.house_ai_version is None
+        )
+        house_ai = (
+            self.subject_kind == ExecutionSubjectKind.HOUSE_AI
+            and self.submission_version_id is None
+            and bool(self.house_ai_id)
+            and self.house_ai_version is not None
+            and self.house_ai_version > 0
+        )
+        if not participant and not house_ai:
+            raise ValueError("EXECUTION_SUBJECT_IDENTITY_INVALID")
 
 
 class SandboxPolicy(BaseModel):
@@ -203,11 +235,14 @@ class LeaseFenceAuthority:
 @dataclass(frozen=True)
 class StagedArtifact:
     execution_id: uuid.UUID
-    submission_version_id: uuid.UUID
+    submission_version_id: uuid.UUID | None
     digest: str
     size: int
     content: bytes = field(repr=False)
     read_only: bool = True
+    subject_kind: ExecutionSubjectKind = ExecutionSubjectKind.PARTICIPANT
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -268,8 +303,11 @@ class SandboxAdapter(Protocol):
         self,
         execution_id: uuid.UUID,
         artifact_bytes: bytes,
-        submission_version_id: uuid.UUID,
+        submission_version_id: uuid.UUID | None,
         expected_digest: str,
+        *,
+        house_ai_id: str | None = None,
+        house_ai_version: int | None = None,
     ) -> StagedArtifact: ...
     def start(self, execution_id: uuid.UUID) -> SandboxSnapshot: ...
     def send_input(self, execution_id: uuid.UUID, message: AIKMessage) -> None: ...
@@ -288,20 +326,35 @@ class SandboxAdapter(Protocol):
 class SandboxEvidence:
     execution_id: uuid.UUID
     artifact_digest: str
-    submission_version_id: uuid.UUID
+    submission_version_id: uuid.UUID | None
     state: ExecutionState
     failure_class: FailureClass | None
     stdout_bytes: int
     stderr_bytes: int
-    process_count: int
-    memory_bytes: int
-    filesystem_bytes: int
-    filesystem_inodes: int
-    file_descriptors: int
-    cpu_millicores: int
+    process_count: int | None
+    memory_bytes: int | None
+    filesystem_bytes: int | None
+    filesystem_inodes: int | None
+    file_descriptors: int | None
+    cpu_millicores: int | None
     started_monotonic: float | None
     observed_monotonic: float
     cleanup: CleanupResult | None
+    subject_kind: ExecutionSubjectKind = ExecutionSubjectKind.PARTICIPANT
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
+    match_id: uuid.UUID | None = None
+    worker_id: str | None = None
+    lease_id: uuid.UUID | None = None
+    fencing_token: int | None = None
+    policy_digest: str | None = None
+    runtime_identity: str | None = None
+    container_id: str | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    termination_reason: str | None = None
+    stdout_evidence: bytes = field(default=b"", repr=False)
+    stderr_evidence: bytes = field(default=b"", repr=False)
 
 
 class FakeSandboxAdapter:
@@ -373,14 +426,28 @@ class FakeSandboxAdapter:
         self,
         execution_id: uuid.UUID,
         artifact_bytes: bytes,
-        submission_version_id: uuid.UUID,
+        submission_version_id: uuid.UUID | None,
         expected_digest: str,
+        *,
+        house_ai_id: str | None = None,
+        house_ai_version: int | None = None,
     ) -> StagedArtifact:
         record = self._record(execution_id)
         self._guard(record)
         identity: ExecutionIdentity = record["identity"]
-        if submission_version_id != identity.submission_version_id:
-            raise IdentityMismatchError("SUBMISSION_VERSION_MISMATCH")
+        if identity.subject_kind == ExecutionSubjectKind.PARTICIPANT:
+            if (
+                submission_version_id != identity.submission_version_id
+                or house_ai_id is not None
+                or house_ai_version is not None
+            ):
+                raise IdentityMismatchError("SUBMISSION_VERSION_MISMATCH")
+        elif (
+            submission_version_id is not None
+            or house_ai_id != identity.house_ai_id
+            or house_ai_version != identity.house_ai_version
+        ):
+            raise IdentityMismatchError("HOUSE_AI_VERSION_MISMATCH")
         if expected_digest != identity.artifact_digest:
             raise IdentityMismatchError("EXPECTED_DIGEST_MISMATCH")
         if hashlib.sha256(artifact_bytes).hexdigest() != identity.artifact_digest:
@@ -393,6 +460,9 @@ class FakeSandboxAdapter:
             identity.artifact_digest,
             len(artifact_bytes),
             bytes(artifact_bytes),
+            subject_kind=identity.subject_kind,
+            house_ai_id=identity.house_ai_id,
+            house_ai_version=identity.house_ai_version,
         )
         record["staged"] = staged
         self._move(record, ExecutionState.STAGED)
@@ -523,6 +593,9 @@ class FakeSandboxAdapter:
             execution_id=execution_id,
             artifact_digest=record["identity"].artifact_digest,
             submission_version_id=record["identity"].submission_version_id,
+            subject_kind=record["identity"].subject_kind,
+            house_ai_id=record["identity"].house_ai_id,
+            house_ai_version=record["identity"].house_ai_version,
             state=record["state"],
             failure_class=record["failure"],
             stdout_bytes=min(observation.stdout_bytes, 2**63 - 1),

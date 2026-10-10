@@ -86,3 +86,51 @@ test("event status and official selection use authenticated event contracts", as
     });
   } finally { restore(); }
 });
+
+test("submission upload sends exact archive bytes with participant authorization", async () => {
+  const bytes = new Uint8Array([0, 1, 37, 255]);
+  const restore = mockFetch(async (url, options) => {
+    assert.equal(url, "/api/v1/submissions/sub_123/versions");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, "Bearer opaque-session");
+    assert.equal(options.headers["Content-Type"], "application/x-tar");
+    assert.deepEqual([...new Uint8Array(options.body)], [...bytes]);
+    return new Response(JSON.stringify({ version: { state: "APPROVED" } }), { status: 201 });
+  });
+  try {
+    const result = await api.uploadVersion("opaque-session", "sub_123", bytes);
+    assert.equal(result.version.state, "APPROVED");
+  } finally { restore(); }
+});
+
+test("oversized artifact errors tell the participant to reduce the package size", async () => {
+  const restore = mockFetch(async () => new Response(JSON.stringify({ error: "PACKAGE_TOO_LARGE" }), { status: 413 }));
+  try {
+    await assert.rejects(api.uploadVersion("opaque-session", "sub_123", new Uint8Array([1])), (error) => {
+      assert.equal(error.status, 413);
+      assert.match(error.message, /reduce its size/i);
+      return true;
+    });
+  } finally { restore(); }
+});
+
+test("development match creation binds exact request and idempotency key", async () => {
+  const restore = mockFetch(async (url, options) => {
+    assert.equal(url, "/api/v1/participants/me/development-matches");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, "Bearer opaque-session");
+    assert.equal(options.headers["Idempotency-Key"], "dev-match-1");
+    assert.deepEqual(JSON.parse(options.body), {
+      submission_id: "00000000-0000-0000-0000-000000000001",
+      version: 2,
+    });
+    return new Response(JSON.stringify({ match_id: "match-1", state: "QUEUED" }), { status: 201 });
+  });
+  try {
+    const result = await api.requestDevelopmentMatch("opaque-session", {
+      submission_id: "00000000-0000-0000-0000-000000000001",
+      version: 2,
+    }, "dev-match-1");
+    assert.equal(result.state, "QUEUED");
+  } finally { restore(); }
+});

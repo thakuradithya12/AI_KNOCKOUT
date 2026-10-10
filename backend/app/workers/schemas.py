@@ -34,6 +34,9 @@ class WorkerCapabilities(StrictModel):
     sandbox_version: StrictStr = Field(min_length=1, max_length=128)
     sandbox_digest: StrictStr = Field(pattern="^[0-9a-f]{64}$")
     protocol_versions: list[StrictStr] = Field(max_length=8)
+    execution_modes: list[Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"]] = Field(
+        default_factory=lambda: ["MOCK_PROTOCOL_ONLY"], max_length=2
+    )
 
     @field_validator("protocol_versions")
     @classmethod
@@ -43,6 +46,13 @@ class WorkerCapabilities(StrictModel):
         encoded = json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("ascii")
         if len(encoded) > 512:
             raise ValueError("protocol metadata exceeds 512 bytes")
+        return values
+
+    @field_validator("execution_modes")
+    @classmethod
+    def unique_execution_modes(cls, values: list[str]) -> list[str]:
+        if not values or len(values) != len(set(values)):
+            raise ValueError("execution modes must be non-empty and unique")
         return values
 
 
@@ -65,6 +75,17 @@ class LeaseOperation(StrictModel):
     lease_id: uuid.UUID
     fencing_token: StrictInt = Field(ge=1)
     sequence: StrictInt = Field(ge=1)
+
+
+class MatchCommandRequest(StrictModel):
+    lease_id: uuid.UUID
+    fencing_token: StrictInt = Field(ge=1)
+    attempt: StrictInt = Field(ge=1, le=2**31 - 1)
+
+
+class MatchResponseRequest(MatchCommandRequest):
+    command_id: StrictStr = Field(min_length=1, max_length=64)
+    payload: StrictStr = Field(min_length=1, max_length=65_536)
 
 
 class LeaseOut(StrictModel):
@@ -90,6 +111,7 @@ class ResourcePolicy(StrictModel):
     move_timeout_ms: StrictInt = Field(ge=1, le=3600000)
     process_lifetime_ms: StrictInt = Field(ge=1, le=86400000)
     concurrency_per_worker: StrictInt = Field(ge=1, le=128)
+    network_mode: Literal["DENY_ALL"] = "DENY_ALL"
 
 
 class HeartbeatIn(StrictModel):
@@ -190,17 +212,26 @@ class WorkerOperationOut(StrictModel):
 
 class JobOut(StrictModel):
     execution_id: uuid.UUID
-    execution_mode: Literal["MOCK_PROTOCOL_ONLY"]
+    execution_mode: Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"]
+    execution_kind: Literal["PARTICIPANT", "HOUSE_AI"]
     match_id: uuid.UUID | None
+    match_side_id: uuid.UUID | None = None
+    match_purpose: Literal["PEER_TEST", "OFFICIAL", "DEVELOPMENT"] | None = None
     worker_id: str
-    participant_id: str
-    submission_id: uuid.UUID
-    submission_version: int
+    participant_id: str | None
+    submission_id: uuid.UUID | None
+    submission_version: int | None
+    submission_version_id: uuid.UUID | None = None
+    house_ai_id: str | None = None
+    house_ai_version: int | None = None
     artifact_sha256: str
     immutable_artifact_ref: str
     runtime_profile: str
     protocol_version: str
     initial_state: dict[str, Any]
     resource_policy: ResourcePolicy
+    policy_digest: str | None = None
+    attempt_number: int
+    created_at: datetime
     execution_expires_at: datetime
     lease: LeaseOut

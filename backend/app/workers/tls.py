@@ -38,6 +38,18 @@ class VerifiedWorkerCertificate:
 
 
 @dataclass(frozen=True)
+class VerifiedServiceCertificate:
+    fingerprint: str
+    service_name: str
+    not_before: datetime
+    not_after: datetime
+
+
+GATEWAY_SERVICE_ID = "urn:aik:service:worker-gateway"
+COORDINATOR_SERVICE_ID = "urn:aik:service:match-coordinator"
+
+
+@dataclass(frozen=True)
 class WorkerGatewayTLSConfig:
     ca_certificate: Path
     server_certificate: Path
@@ -173,6 +185,191 @@ class WorkerClientTLSConfig:
             certfile=str(self.worker_certificate), keyfile=str(self.worker_private_key)
         )
         return context
+
+
+@dataclass(frozen=True)
+class GatewayServiceClientTLSConfig:
+    """Gateway identity for gateway→coordinator mTLS, separate from worker TLS."""
+
+    ca_certificate: Path
+    gateway_certificate: Path
+    gateway_private_key: Path
+    coordinator_server_name: str
+
+    @classmethod
+    def from_env(cls) -> GatewayServiceClientTLSConfig:
+        names = {
+            "MATCH_SERVICE_CA_CERT": os.environ.get("MATCH_SERVICE_CA_CERT"),
+            "GATEWAY_SERVICE_CERT": os.environ.get("GATEWAY_SERVICE_CERT"),
+            "GATEWAY_SERVICE_KEY": os.environ.get("GATEWAY_SERVICE_KEY"),
+            "COORDINATOR_SERVER_NAME": os.environ.get("COORDINATOR_SERVER_NAME"),
+        }
+        missing = [key for key, value in names.items() if not value]
+        if missing:
+            raise WorkerTLSConfigurationError(
+                "required gateway service TLS configuration is missing: " + ", ".join(missing)
+            )
+        return cls(
+            ca_certificate=Path(names["MATCH_SERVICE_CA_CERT"]),
+            gateway_certificate=Path(names["GATEWAY_SERVICE_CERT"]),
+            gateway_private_key=Path(names["GATEWAY_SERVICE_KEY"]),
+            coordinator_server_name=names["COORDINATOR_SERVER_NAME"],
+        )
+
+    def build_ssl_context(self) -> ssl.SSLContext:
+        for name, path in (
+            ("service CA certificate", self.ca_certificate),
+            ("gateway service certificate", self.gateway_certificate),
+            ("gateway service private key", self.gateway_private_key),
+        ):
+            if not path.is_file():
+                raise WorkerTLSConfigurationError(f"configured {name} file is unavailable")
+        _check_private_key_permissions(self.gateway_private_key)
+        roots = _load_certificates(self.ca_certificate)
+        leaf = _load_certificates(self.gateway_certificate)[0]
+        _require_valid_dates(leaf)
+        _require_signed_by_trusted_ca(leaf, roots)
+        _require_key_matches(leaf, self.gateway_private_key)
+        _require_service_identity(leaf, GATEWAY_SERVICE_ID, ExtendedKeyUsageOID.CLIENT_AUTH)
+        context = ssl.create_default_context(
+            ssl.Purpose.SERVER_AUTH, cafile=str(self.ca_certificate)
+        )
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.options |= ssl.OP_NO_COMPRESSION
+        context.load_cert_chain(str(self.gateway_certificate), str(self.gateway_private_key))
+        return context
+
+
+@dataclass(frozen=True)
+class MatchCoordinatorServiceTLSConfig:
+    """Private coordinator listener identity and dedicated gateway trust root."""
+
+    ca_certificate: Path
+    server_certificate: Path
+    server_private_key: Path
+    server_name: str
+    bind_host: str
+    port: int
+
+    @classmethod
+    def from_env(cls) -> MatchCoordinatorServiceTLSConfig:
+        enabled = os.environ.get("MATCH_CONTROL_TLS_ENABLED", "").strip().lower()
+        if enabled != "true":
+            raise WorkerTLSConfigurationError("MATCH_CONTROL_TLS_ENABLED must be true")
+        names = {
+            "MATCH_SERVICE_CA_CERT": os.environ.get("MATCH_SERVICE_CA_CERT"),
+            "COORDINATOR_SERVER_CERT": os.environ.get("COORDINATOR_SERVER_CERT"),
+            "COORDINATOR_SERVER_KEY": os.environ.get("COORDINATOR_SERVER_KEY"),
+            "COORDINATOR_SERVER_NAME": os.environ.get("COORDINATOR_SERVER_NAME"),
+            "MATCH_CONTROL_BIND_HOST": os.environ.get("MATCH_CONTROL_BIND_HOST"),
+        }
+        missing = [key for key, value in names.items() if not value]
+        if missing:
+            raise WorkerTLSConfigurationError(
+                "required match control TLS configuration is missing: " + ", ".join(missing)
+            )
+        try:
+            host = str(ipaddress.ip_address(names["MATCH_CONTROL_BIND_HOST"]))
+            port = int(os.environ.get("MATCH_CONTROL_PORT", "8444"))
+        except ValueError as exc:
+            raise WorkerTLSConfigurationError("match control bind address/port is invalid") from exc
+        config = cls(
+            ca_certificate=Path(names["MATCH_SERVICE_CA_CERT"]),
+            server_certificate=Path(names["COORDINATOR_SERVER_CERT"]),
+            server_private_key=Path(names["COORDINATOR_SERVER_KEY"]),
+            server_name=names["COORDINATOR_SERVER_NAME"],
+            bind_host=host,
+            port=port,
+        )
+        config.validate_server_material()
+        return config
+
+    def validate_server_material(self) -> tuple[x509.Certificate, ...]:
+        host = ipaddress.ip_address(self.bind_host)
+        if host.is_unspecified or not (host.is_private or host.is_loopback):
+            raise WorkerTLSConfigurationError("coordinator listener must bind privately")
+        if not 1 <= self.port <= 65535:
+            raise WorkerTLSConfigurationError("coordinator port is invalid")
+        for name, path in (
+            ("service CA certificate", self.ca_certificate),
+            ("coordinator server certificate", self.server_certificate),
+            ("coordinator private key", self.server_private_key),
+        ):
+            if not path.is_file():
+                raise WorkerTLSConfigurationError(f"configured {name} file is unavailable")
+        _check_private_key_permissions(self.server_private_key)
+        roots = _load_certificates(self.ca_certificate)
+        leaf = _load_certificates(self.server_certificate)[0]
+        _require_valid_dates(leaf)
+        _require_signed_by_trusted_ca(leaf, roots)
+        _require_key_matches(leaf, self.server_private_key)
+        _require_service_identity(leaf, COORDINATOR_SERVICE_ID, ExtendedKeyUsageOID.SERVER_AUTH)
+        try:
+            names = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            if self.server_name not in names.get_values_for_type(x509.DNSName):
+                raise WorkerTLSConfigurationError("coordinator server SAN mismatch")
+        except x509.ExtensionNotFound as exc:
+            raise WorkerTLSConfigurationError("coordinator certificate requires DNS SAN") from exc
+        return roots
+
+    def build_server_ssl_context(self) -> ssl.SSLContext:
+        roots = self.validate_server_material()
+        context = ssl.create_default_context(
+            ssl.Purpose.CLIENT_AUTH, cafile=str(self.ca_certificate)
+        )
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.options |= ssl.OP_NO_COMPRESSION
+        context.load_cert_chain(str(self.server_certificate), str(self.server_private_key))
+        if not roots:
+            raise WorkerTLSConfigurationError("service CA bundle is empty")
+        return context
+
+
+def _require_service_identity(
+    certificate: x509.Certificate, expected: str, eku: x509.ObjectIdentifier
+) -> None:
+    try:
+        names = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        uris = names.get_values_for_type(x509.UniformResourceIdentifier)
+        if uris != [expected] or any(uri.startswith("urn:aik:worker:") for uri in uris):
+            raise WorkerTLSConfigurationError("service certificate URI SAN mismatch")
+        usages = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        if eku not in usages:
+            raise WorkerTLSConfigurationError("service certificate EKU mismatch")
+    except x509.ExtensionNotFound as exc:
+        raise WorkerTLSConfigurationError("service certificate requires SAN and EKU") from exc
+
+
+def verified_gateway_service_from_scope(
+    scope: dict, trusted_ca_certificates: tuple[x509.Certificate, ...] | None
+) -> VerifiedServiceCertificate | None:
+    """Validate the coordinator's peer as the dedicated gateway service identity."""
+    extensions = scope.get("extensions")
+    tls = extensions.get("tls") if isinstance(extensions, dict) else None
+    if not isinstance(tls, dict) or tls.get("client_cert_error"):
+        return None
+    chain = tls.get("client_cert_chain")
+    if not isinstance(chain, (list, tuple)) or not chain or not isinstance(chain[0], str):
+        return None
+    if not trusted_ca_certificates:
+        return None
+    try:
+        leaf = x509.load_pem_x509_certificate(chain[0].encode("ascii"))
+        _require_valid_dates(leaf)
+        _require_signed_by_trusted_ca(leaf, trusted_ca_certificates)
+        _require_service_identity(leaf, GATEWAY_SERVICE_ID, ExtendedKeyUsageOID.CLIENT_AUTH)
+        der = leaf.public_bytes(Encoding.DER)
+    except (ValueError, UnicodeEncodeError, AttributeError, WorkerTLSConfigurationError):
+        return None
+    return VerifiedServiceCertificate(
+        fingerprint=hashlib.sha256(der).hexdigest(),
+        service_name=GATEWAY_SERVICE_ID,
+        not_before=leaf.not_valid_before_utc,
+        not_after=leaf.not_valid_after_utc,
+    )
 
 
 def _load_certificates(path: Path) -> tuple[x509.Certificate, ...]:

@@ -18,12 +18,14 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     String,
     UniqueConstraint,
     Uuid,
     event,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -132,6 +134,34 @@ class WorkerEnrollmentToken(Base):
 class WorkerExecutionJob(Base):
     __tablename__ = "worker_execution_jobs"
     __table_args__ = (
+        Index(
+            "uq_worker_job_current_match_participant",
+            "match_id",
+            "participant_id",
+            unique=True,
+            postgresql_where=text(
+                "match_id IS NOT NULL AND participant_id IS NOT NULL AND status IN "
+                "('QUEUED','LEASED','ACKNOWLEDGED','CLEANUP_REPORTED')"
+            ),
+            sqlite_where=text(
+                "match_id IS NOT NULL AND participant_id IS NOT NULL AND status IN "
+                "('QUEUED','LEASED','ACKNOWLEDGED','CLEANUP_REPORTED')"
+            ),
+        ),
+        Index(
+            "uq_worker_job_current_match_house_ai",
+            "match_id",
+            "house_ai_id",
+            unique=True,
+            postgresql_where=text(
+                "match_id IS NOT NULL AND house_ai_id IS NOT NULL AND status IN "
+                "('QUEUED','LEASED','ACKNOWLEDGED','CLEANUP_REPORTED')"
+            ),
+            sqlite_where=text(
+                "match_id IS NOT NULL AND house_ai_id IS NOT NULL AND status IN "
+                "('QUEUED','LEASED','ACKNOWLEDGED','CLEANUP_REPORTED')"
+            ),
+        ),
         UniqueConstraint("execution_id", name="uq_worker_job_execution"),
         CheckConstraint(
             "(execution_kind = 'PARTICIPANT' AND participant_id IS NOT NULL "
@@ -147,6 +177,10 @@ class WorkerExecutionJob(Base):
         CheckConstraint(
             "submission_version IS NULL OR submission_version > 0",
             name="ck_worker_job_version_positive",
+        ),
+        CheckConstraint(
+            "execution_mode IN ('MOCK_PROTOCOL_ONLY', 'KATA_AI_EXECUTION')",
+            name="ck_worker_job_execution_mode",
         ),
         ForeignKeyConstraint(
             ["submission_version_id", "participant_id", "submission_id", "artifact_sha256"],
@@ -214,6 +248,22 @@ class WorkerExecutionJob(Base):
 
 class WorkerArtifactCapability(Base):
     __tablename__ = "worker_artifact_capabilities"
+    __table_args__ = (
+        CheckConstraint(
+            "(execution_kind = 'PARTICIPANT' AND submission_version_id IS NOT NULL "
+            "AND house_ai_id IS NULL AND house_ai_version IS NULL) OR "
+            "(execution_kind = 'HOUSE_AI' AND submission_version_id IS NULL "
+            "AND house_ai_id IS NOT NULL AND house_ai_version IS NOT NULL)",
+            name="ck_worker_capability_subject_kind",
+        ),
+        ForeignKeyConstraint(
+            ["house_ai_id", "house_ai_version", "artifact_sha256"],
+            ["house_ai_versions.house_ai_id", "house_ai_versions.version",
+             "house_ai_versions.artifact_sha256"],
+            ondelete="RESTRICT",
+            name="fk_worker_capability_house_ai_subject",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
@@ -225,10 +275,16 @@ class WorkerArtifactCapability(Base):
     )
     lease_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     fencing_token: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    submission_version_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=False
+    execution_kind: Mapped[ExecutionKind] = mapped_column(
+        Enum(ExecutionKind, native_enum=False, length=16), nullable=False,
+        default=ExecutionKind.PARTICIPANT,
     )
+    artifact_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    submission_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("submission_versions.id", ondelete="RESTRICT"), nullable=True
+    )
+    house_ai_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    house_ai_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operation: Mapped[str] = mapped_column(String(32), nullable=False, default="DOWNLOAD_ARCHIVE")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     max_uses: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

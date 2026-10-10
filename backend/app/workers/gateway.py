@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
-from app.models.worker import ExecutionJobStatus, Worker
+from app.models.match import (
+    HouseAIMatchSideBinding,
+    Match,
+    MatchExecutionBinding,
+    MatchSide,
+    MatchSideKind,
+    ParticipantMatchSideBinding,
+)
+from app.models.worker import ExecutionJobStatus, Worker, WorkerExecutionJob
 from app.workers.schemas import (
     ArtifactCapabilityIn,
     ArtifactCapabilityOut,
@@ -20,12 +34,15 @@ from app.workers.schemas import (
     JobOut,
     LeaseOut,
     LeaseRenewalIn,
+    MatchCommandRequest,
+    MatchResponseRequest,
     WorkerEnrollmentIn,
     WorkerIdentityOut,
     WorkerOperationOut,
 )
 from app.workers.service import (
     WorkerProtocolError,
+    _lease_valid,
     acknowledge_job,
     authenticate_worker,
     claim_job,
@@ -37,10 +54,15 @@ from app.workers.service import (
     submit_cleanup,
     submit_evidence,
 )
-from app.workers.tls import WorkerGatewayTLSConfig, verified_peer_from_scope
+from app.workers.tls import (
+    GatewayServiceClientTLSConfig,
+    WorkerGatewayTLSConfig,
+    verified_peer_from_scope,
+)
 
 router = APIRouter(prefix="/worker/v1", tags=["worker-gateway"])
 MAX_WORKER_REQUEST_BYTES = 16 * 1024
+MAX_MATCH_RESPONSE_BYTES = 400 * 1024
 
 
 class WorkerRequestSizeLimit:
@@ -54,13 +76,18 @@ class WorkerRequestSizeLimit:
         if scope["type"] != "http" or not scope.get("path", "").startswith("/worker/"):
             await self.app(scope, receive, send)
             return
+        request_limit = (
+            MAX_MATCH_RESPONSE_BYTES
+            if scope.get("path", "").endswith("/match/response")
+            else self.max_bytes
+        )
         length = next(
             (value for key, value in scope.get("headers", []) if key.lower() == b"content-length"),
             None,
         )
         if length is not None:
             try:
-                too_large = int(length) > self.max_bytes
+                too_large = int(length) > request_limit
             except ValueError:
                 too_large = True
             if too_large:
@@ -76,7 +103,7 @@ class WorkerRequestSizeLimit:
                 return
             chunk = message.get("body", b"")
             total += len(chunk)
-            if total > self.max_bytes:
+            if total > request_limit:
                 await self._reject(send)
                 return
             chunks.append(chunk)
@@ -185,18 +212,27 @@ async def claim_worker_job(
         return None
     return JobOut(
         execution_id=job.execution_id,
-        execution_mode="MOCK_PROTOCOL_ONLY",
+        execution_mode=job.execution_mode,
+        execution_kind=job.execution_kind.value,
         match_id=job.match_id,
+        match_side_id=await _job_side_id(db, job),
+        match_purpose=(await db.get(Match, job.match_id)).purpose.value if job.match_id else None,
         worker_id=worker.worker_id,
         participant_id=job.participant_id,
         submission_id=job.submission_id,
         submission_version=job.submission_version,
+        submission_version_id=job.submission_version_id,
+        house_ai_id=job.house_ai_id,
+        house_ai_version=job.house_ai_version,
         artifact_sha256=job.artifact_sha256,
         immutable_artifact_ref=job.immutable_artifact_ref,
         runtime_profile=job.runtime_profile,
         protocol_version=job.protocol_version,
         initial_state=job.initial_state,
         resource_policy=job.resource_policy,
+        policy_digest=job.initial_state.get("policy_digest"),
+        attempt_number=await _next_match_attempt(db, job),
+        created_at=job.created_at,
         execution_expires_at=job.execution_expires_at,
         lease=LeaseOut(
             lease_id=job.lease_id,
@@ -205,6 +241,50 @@ async def claim_worker_job(
             next_sequence=job.last_sequence + 1,
         ),
     )
+
+
+async def _job_side_id(db: AsyncSession, job) -> uuid.UUID | None:
+    if job.match_id is None:
+        return None
+    binding = (
+        ParticipantMatchSideBinding
+        if job.execution_kind.value == "PARTICIPANT"
+        else HouseAIMatchSideBinding
+    )
+    statement = select(MatchSide.id).join(
+        binding, binding.match_side_id == MatchSide.id
+    ).where(MatchSide.match_id == job.match_id)
+    if job.execution_kind.value == "PARTICIPANT":
+        statement = statement.where(
+            MatchSide.kind == MatchSideKind.PARTICIPANT,
+            binding.submission_version_id == job.submission_version_id,
+        )
+    else:
+        statement = statement.where(
+            MatchSide.kind == MatchSideKind.HOUSE_AI,
+            binding.house_ai_id == job.house_ai_id,
+            binding.house_ai_version == job.house_ai_version,
+        )
+    return await db.scalar(statement)
+
+
+async def _next_match_attempt(db: AsyncSession, job) -> int:
+    side_id = await _job_side_id(db, job)
+    if side_id is None:
+        return max(1, job.fencing_token)
+    current_attempt = await db.scalar(
+        select(MatchExecutionBinding.attempt_number).where(
+            MatchExecutionBinding.execution_id == job.execution_id
+        )
+    )
+    if current_attempt is not None:
+        return current_attempt
+    latest = await db.scalar(
+        select(func.max(MatchExecutionBinding.attempt_number)).where(
+            MatchExecutionBinding.match_side_id == side_id
+        )
+    )
+    return (latest or 0) + 1
 
 
 @router.post("/jobs/{execution_id}/acknowledgement", response_model=WorkerOperationOut)
@@ -279,6 +359,120 @@ async def transfer_artifact(
     )
 
 
+@router.post("/jobs/{execution_id}/match/next")
+async def next_match_command(
+    execution_id: uuid.UUID,
+    payload: MatchCommandRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_worker_db),
+    worker: Worker = Depends(require_worker),
+):
+    authority = await _control_authority(
+        db, worker=worker, execution_id=execution_id, lease_id=payload.lease_id,
+        fence=payload.fencing_token, attempt=payload.attempt,
+    )
+    body = await run_in_threadpool(
+        _post_match_control, request, "/internal/v1/commands/issue", authority
+    )
+    return body
+
+
+@router.post("/jobs/{execution_id}/match/response")
+async def submit_match_response(
+    execution_id: uuid.UUID,
+    payload: MatchResponseRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_worker_db),
+    worker: Worker = Depends(require_worker),
+):
+    authority = await _control_authority(
+        db, worker=worker, execution_id=execution_id, lease_id=payload.lease_id,
+        fence=payload.fencing_token, attempt=payload.attempt,
+    )
+    authority.update(command_id=payload.command_id, payload=payload.payload)
+    return await run_in_threadpool(
+        _post_match_control, request, "/internal/v1/commands/respond", authority
+    )
+
+
+async def _control_authority(db, *, worker, execution_id, lease_id, fence, attempt):
+    job = await db.scalar(
+        select(WorkerExecutionJob).where(
+            WorkerExecutionJob.execution_id == execution_id
+        )
+    )
+    if job is None:
+        raise WorkerProtocolError(404, "EXECUTION_NOT_FOUND")
+    _lease_valid(job, worker, lease_id, fence)
+    if job.status != ExecutionJobStatus.ACKNOWLEDGED or job.match_id is None:
+        raise WorkerProtocolError(409, "MATCH_EXECUTION_NOT_READY")
+    side_id = await _job_side_id(db, job)
+    side = await db.get(MatchSide, side_id) if side_id else None
+    if side is None:
+        raise WorkerProtocolError(409, "MATCH_SIDE_BINDING_MISSING")
+    existing_attempt = await db.scalar(
+        select(MatchExecutionBinding.attempt_number).where(
+            MatchExecutionBinding.execution_id == execution_id
+        )
+    )
+    if existing_attempt is None:
+        last_attempt = await db.scalar(
+            select(func.max(MatchExecutionBinding.attempt_number)).where(
+                MatchExecutionBinding.match_side_id == side.id
+            )
+        )
+        existing_attempt = (last_attempt or 0) + 1
+    if attempt != existing_attempt:
+        raise WorkerProtocolError(409, "EXECUTION_ATTEMPT_MISMATCH")
+    match = await db.get(Match, job.match_id)
+    if match is None or match.purpose.value != "DEVELOPMENT":
+        raise WorkerProtocolError(409, "DEVELOPMENT_MATCH_REQUIRED")
+    result = {
+        "match_id": str(match.id),
+        "side_id": str(side.id),
+        "execution_id": str(execution_id),
+        "worker_id": worker.worker_id,
+        "worker_certificate_fingerprint": worker.certificate_fingerprint,
+        "side": side.color.value,
+        "lease_id": str(lease_id),
+        "fence_token": fence,
+        "attempt": attempt,
+    }
+    await db.commit()
+    return result
+
+
+def _post_match_control(request: Request, path: str, body: dict):
+    endpoint = getattr(request.app.state, "match_coordinator_url", None)
+    context = getattr(request.app.state, "match_coordinator_ssl_context", None)
+    if not endpoint or context is None:
+        raise WorkerProtocolError(503, "MATCH_CONTROL_UNAVAILABLE")
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + path,
+        data=json.dumps(body, separators=(",", ":"), allow_nan=False).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, context=context, timeout=5) as response:
+            raw = response.read(MAX_MATCH_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_MATCH_RESPONSE_BYTES:
+            raise WorkerProtocolError(502, "MATCH_CONTROL_RESPONSE_TOO_LARGE")
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise WorkerProtocolError(502, "MATCH_CONTROL_RESPONSE_INVALID")
+        return result
+    except urllib.error.HTTPError as exc:
+        try:
+            response_body = json.loads(exc.read(MAX_WORKER_REQUEST_BYTES))
+            detail = response_body.get("detail") if isinstance(response_body, dict) else None
+        except (ValueError, OSError):
+            detail = None
+        if not isinstance(detail, str) or not detail.isidentifier() or len(detail) > 96:
+            detail = f"HTTP_{exc.code}"
+        raise WorkerProtocolError(409, f"MATCH_CONTROL_{detail}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise WorkerProtocolError(503, "MATCH_CONTROL_UNAVAILABLE") from exc
 @router.post("/jobs/{execution_id}/evidence", response_model=WorkerOperationOut)
 async def report_evidence(
     execution_id: uuid.UUID,
@@ -363,6 +557,22 @@ def create_worker_gateway_app():
         database_url = os.environ.get("WORKER_DATABASE_URL")
         if not database_url:
             raise RuntimeError("WORKER_DATABASE_URL must be configured")
+        control_url = os.environ.get("MATCH_COORDINATOR_URL")
+        if not control_url:
+            raise RuntimeError("MATCH_COORDINATOR_URL must be configured")
+        parsed_control_url = urllib.parse.urlsplit(control_url)
+        service_tls = GatewayServiceClientTLSConfig.from_env()
+        if (
+            parsed_control_url.scheme != "https"
+            or parsed_control_url.hostname != service_tls.coordinator_server_name
+            or parsed_control_url.username is not None
+            or parsed_control_url.password is not None
+            or parsed_control_url.query
+            or parsed_control_url.fragment
+        ):
+            raise RuntimeError("MATCH_COORDINATOR_URL is invalid")
+        app.state.match_coordinator_url = control_url.rstrip("/")
+        app.state.match_coordinator_ssl_context = service_tls.build_ssl_context()
         tls_config = WorkerGatewayTLSConfig.from_env()
         app.state.worker_tls_config = tls_config
         app.state.worker_tls_ssl_context = tls_config.build_server_ssl_context()

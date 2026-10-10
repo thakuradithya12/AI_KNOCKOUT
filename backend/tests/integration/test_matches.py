@@ -233,31 +233,30 @@ async def test_execution_binding_requires_exact_acknowledged_worker_jobs_and_rea
             other_side = next(candidate for candidate in sides if candidate.id != side.id)
             wrong_execution_id = uuid.uuid4()
             wrong_lease_id = uuid.uuid4()
-            db_session.add(
-                WorkerExecutionJob(
-                    id=uuid.uuid4(),
-                    execution_id=wrong_execution_id,
-                    match_id=match.id,
-                    participant_id=other_side.participant_id,
-                    submission_id=other_side.submission_id,
-                    submission_version=1,
-                    submission_version_id=other_side.submission_version_id,
-                    artifact_sha256=other_side.artifact_sha256,
-                    immutable_artifact_ref=other_side.artifact_sha256,
-                    runtime_profile=other_side.runtime_profile,
-                    protocol_version=other_side.protocol_version,
-                    execution_mode="MOCK_PROTOCOL_ONLY",
-                    initial_state={},
-                    resource_policy={},
-                    execution_expires_at=expires,
-                    status=ExecutionJobStatus.ACKNOWLEDGED,
-                    assigned_worker_id=worker_id,
-                    lease_id=wrong_lease_id,
-                    fencing_token=6,
-                    lease_expires_at=expires,
-                    last_sequence=0,
-                )
+            wrong_job = WorkerExecutionJob(
+                id=uuid.uuid4(),
+                execution_id=wrong_execution_id,
+                match_id=match.id,
+                participant_id=other_side.participant_id,
+                submission_id=other_side.submission_id,
+                submission_version=1,
+                submission_version_id=other_side.submission_version_id,
+                artifact_sha256=other_side.artifact_sha256,
+                immutable_artifact_ref=other_side.artifact_sha256,
+                runtime_profile=other_side.runtime_profile,
+                protocol_version=other_side.protocol_version,
+                execution_mode="MOCK_PROTOCOL_ONLY",
+                initial_state={},
+                resource_policy={},
+                execution_expires_at=expires,
+                status=ExecutionJobStatus.ACKNOWLEDGED,
+                assigned_worker_id=worker_id,
+                lease_id=wrong_lease_id,
+                fencing_token=6,
+                lease_expires_at=expires,
+                last_sequence=0,
             )
+            db_session.add(wrong_job)
             await db_session.flush()
             with pytest.raises(MatchServiceError, match="WORKER_EXECUTION_BINDING_MISMATCH"):
                 await bind_execution(
@@ -269,6 +268,8 @@ async def test_execution_binding_requires_exact_acknowledged_worker_jobs_and_rea
                     lease_id=wrong_lease_id,
                     fencing_token=6,
                 )
+            await db_session.delete(wrong_job)
+            await db_session.flush()
         db_session.add(
             WorkerExecutionJob(
                 id=uuid.uuid4(),

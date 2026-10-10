@@ -14,8 +14,19 @@ from app.models.competition import (
     ValidationAttempt,
     ValidationOutcome,
 )
-from app.models.event import BuildSession, EventControl, OfficialSubmissionSelection
-from app.models.house_ai import HouseAI, HouseAIArtifact, HouseAIVersion
+from app.models.event import (
+    BuildSession,
+    DevelopmentMatchPolicy,
+    EventControl,
+    OfficialSubmissionSelection,
+)
+from app.models.house_ai import (
+    EventHouseAISelection,
+    EventHouseAISelectionControl,
+    HouseAI,
+    HouseAIArtifact,
+    HouseAIVersion,
+)
 from app.models.match import (
     HouseAIMatchSideBinding,
     Match,
@@ -90,8 +101,11 @@ __all__ = [
     "MatchMove",
     "BuildSession",
     "EventControl",
+    "DevelopmentMatchPolicy",
     "OfficialSubmissionSelection",
     "HouseAI",
     "HouseAIArtifact",
     "HouseAIVersion",
+    "EventHouseAISelection",
+    "EventHouseAISelectionControl",
 ]

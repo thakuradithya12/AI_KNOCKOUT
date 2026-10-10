@@ -145,6 +145,8 @@ async def create_match(
         protocol_version=configuration.protocol_version,
         runtime_profile=configuration.runtime_profile,
         policy_version=configuration.policy_version,
+        policy_id=configuration.policy_id,
+        policy_digest=configuration.policy_digest,
         rules_version=configuration.rules_version,
         match_seed=configuration.match_seed,
         initial_fen=configuration.initial_fen,

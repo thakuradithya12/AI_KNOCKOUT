@@ -10,6 +10,7 @@ from app.sandbox.contract import (
     SandboxPolicy,
     SandboxSupervisor,
 )
+from app.sandbox.kata import KataRuntimeConfig, KataSandboxAdapter
 
 __all__ = [
     "AIKMessage",
@@ -17,6 +18,8 @@ __all__ = [
     "ExecutionIdentity",
     "ExecutionState",
     "FakeSandboxAdapter",
+    "KataRuntimeConfig",
+    "KataSandboxAdapter",
     "LeaseFenceAuthority",
     "SandboxPolicy",
     "SandboxSupervisor",

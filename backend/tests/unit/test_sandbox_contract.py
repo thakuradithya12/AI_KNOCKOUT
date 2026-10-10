@@ -17,6 +17,7 @@ from app.sandbox.contract import (
     CleanupResult,
     ExecutionIdentity,
     ExecutionState,
+    ExecutionSubjectKind,
     ExpiredLeaseError,
     FailureClass,
     FakeSandboxAdapter,
@@ -149,6 +150,55 @@ def test_submission_version_mismatch_rejected():
         adapter.stage_artifact(
             identity.execution_id, b"inert-fixture", uuid.uuid4(), identity.artifact_digest
         )
+
+
+def test_house_ai_execution_identity_stages_only_its_exact_digest_subject():
+    now = datetime.now(timezone.utc)
+    content = b"inert House AI fixture"
+    identity = ExecutionIdentity(
+        execution_id=uuid.uuid4(),
+        submission_version_id=None,
+        artifact_digest=hashlib.sha256(content).hexdigest(),
+        policy_profile="development-v1",
+        runtime_profile="python-3.12",
+        worker_id="worker-house-test",
+        lease_id=uuid.uuid4(),
+        fencing_token=1,
+        protocol_version="aik-jsonl/1",
+        lease_expires_at=now + timedelta(minutes=1),
+        subject_kind=ExecutionSubjectKind.HOUSE_AI,
+        house_ai_id="house-test",
+        house_ai_version=3,
+    )
+    authority = LeaseFenceAuthority()
+    authority.set_current(
+        LeaseSnapshot(identity.worker_id, identity.lease_id, 1, identity.lease_expires_at)
+    )
+    adapter = FakeSandboxAdapter(authority, wall_clock=lambda: now)
+    adapter.create_execution(identity, make_policy())
+
+    with pytest.raises(IdentityMismatchError, match="HOUSE_AI_VERSION_MISMATCH"):
+        adapter.stage_artifact(
+            identity.execution_id,
+            content,
+            None,
+            identity.artifact_digest,
+            house_ai_id="house-test",
+            house_ai_version=2,
+        )
+    staged = adapter.stage_artifact(
+        identity.execution_id,
+        content,
+        None,
+        identity.artifact_digest,
+        house_ai_id="house-test",
+        house_ai_version=3,
+    )
+    assert staged.subject_kind == ExecutionSubjectKind.HOUSE_AI
+    assert staged.house_ai_id == "house-test" and staged.house_ai_version == 3
+    assert staged.content == content
+    assert adapter.start(identity.execution_id).state == ExecutionState.RUNNING
+    assert adapter.collect_evidence(identity.execution_id).house_ai_id == "house-test"
 
 
 def test_stale_fencing_token_rejected_for_worker_operation():

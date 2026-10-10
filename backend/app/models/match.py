@@ -142,6 +142,22 @@ class Match(Base):
             "(state IN ('COMPLETED','ABORTED') AND completed_at IS NOT NULL)",
             name="ck_matches_lifecycle_timestamps",
         ),
+        ForeignKeyConstraint(
+            ["policy_id", "policy_version", "policy_digest"],
+            ["development_match_policies.policy_id", "development_match_policies.version",
+             "development_match_policies.policy_digest"],
+            ondelete="RESTRICT",
+            name="fk_match_development_policy",
+        ),
+        CheckConstraint(
+            "(purpose = 'DEVELOPMENT' AND policy_id IS NOT NULL AND policy_digest IS NOT NULL) OR "
+            "(purpose <> 'DEVELOPMENT' AND policy_id IS NULL AND policy_digest IS NULL)",
+            name="ck_match_policy_purpose",
+        ),
+        CheckConstraint(
+            "policy_digest IS NULL OR length(policy_digest) = 64",
+            name="ck_match_policy_digest",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -161,6 +177,8 @@ class Match(Base):
     protocol_version: Mapped[str] = mapped_column(String(64), nullable=False)
     runtime_profile: Mapped[str] = mapped_column(String(64), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    policy_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
     rules_version: Mapped[str] = mapped_column(String(64), nullable=False)
     match_seed: Mapped[str] = mapped_column(String(64), nullable=False)
     initial_fen: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -382,6 +400,8 @@ _MATCH_CONFIG_FIELDS = {
     "protocol_version",
     "runtime_profile",
     "policy_version",
+    "policy_id",
+    "policy_digest",
     "rules_version",
     "match_seed",
     "initial_fen",

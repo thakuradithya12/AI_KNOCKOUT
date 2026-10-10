@@ -9,10 +9,22 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, not_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.competition import ArtifactState, QuarantineObject, SubmissionVersion
+from app.models.event import DevelopmentMatchPolicy
+from app.models.house_ai import HouseAIVersion
+from app.models.match import (
+    HouseAIMatchSideBinding,
+    Match,
+    MatchPurpose,
+    MatchSide,
+    MatchSideKind,
+    MatchState,
+    ParticipantMatchSideBinding,
+)
 from app.models.worker import (
     ExecutionFailureClass,
     ExecutionJobStatus,
@@ -25,6 +37,7 @@ from app.models.worker import (
     WorkerSecurityEvent,
     WorkerStatus,
 )
+from app.services.house_ai_artifacts import HouseAIArtifactError, resolve_house_ai_artifact
 from app.services.quarantine_storage import quarantine_storage
 from app.workers.schemas import ResourcePolicy
 from app.workers.tls import VerifiedWorkerCertificate
@@ -376,14 +389,158 @@ async def revoke_worker(db: AsyncSession, *, worker_id: str, operator_id: str) -
 
 
 async def create_execution_job(
-    db: AsyncSession, *, submission_version_id: uuid.UUID, initial_state: dict,
+    db: AsyncSession, *, submission_version_id: uuid.UUID | None = None,
+    house_ai_id: str | None = None, house_ai_version: int | None = None,
+    initial_state: dict,
     resource_policy: ResourcePolicy, execution_expires_at: datetime,
     match_id: uuid.UUID | None = None,
+    execution_mode: str = "MOCK_PROTOCOL_ONLY",
+    commit: bool = True,
 ) -> WorkerExecutionJob:
-    """Trusted control-plane call only; no public participant route creates jobs."""
-    version = await db.get(SubmissionVersion, submission_version_id)
-    if version is None or version.state != ArtifactState.ELIGIBLE:
-        raise WorkerProtocolError(409, "ARTIFACT_NOT_ELIGIBLE")
+    """Create an exact participant or House AI job for a trusted match orchestrator."""
+    participant_subject = (
+        submission_version_id is not None and house_ai_id is None and house_ai_version is None
+    )
+    house_subject = (
+        submission_version_id is None and house_ai_id is not None and house_ai_version is not None
+    )
+    if not participant_subject and not house_subject:
+        raise WorkerProtocolError(422, "EXECUTION_SUBJECT_INVALID")
+    if execution_mode not in {"MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"}:
+        raise WorkerProtocolError(422, "EXECUTION_MODE_INVALID")
+    if execution_mode == "KATA_AI_EXECUTION" and match_id is None:
+        raise WorkerProtocolError(422, "KATA_MATCH_BINDING_REQUIRED")
+    if house_subject and match_id is None:
+        raise WorkerProtocolError(422, "HOUSE_AI_MATCH_BINDING_REQUIRED")
+    version = None
+    house_identity = None
+    if participant_subject:
+        version = await db.get(SubmissionVersion, submission_version_id)
+        if version is None or version.state != ArtifactState.ELIGIBLE:
+            raise WorkerProtocolError(409, "ARTIFACT_NOT_ELIGIBLE")
+        execution_kind = ExecutionKind.PARTICIPANT
+        artifact_digest = version.artifact_sha256
+        artifact_ref = version.storage_key
+        runtime_profile = version.runtime_profile or "python-3.12"
+        protocol_version = version.protocol_version or "aik-jsonl/1"
+        participant_id = version.participant_id
+        submission_id = version.submission_id
+        version_number = version.version
+        house_ai_id = None
+        house_ai_version = None
+    else:
+        try:
+            house_artifact = await resolve_house_ai_artifact(
+                db,
+                house_ai_id=house_ai_id,
+                version=house_ai_version,
+                expected_digest=(
+                    await db.scalar(
+                        select(HouseAIMatchSideBinding.artifact_sha256)
+                        .join(
+                            MatchSide,
+                            MatchSide.id == HouseAIMatchSideBinding.match_side_id,
+                        )
+                        .where(
+                            MatchSide.match_id == match_id,
+                            MatchSide.kind == MatchSideKind.HOUSE_AI,
+                            HouseAIMatchSideBinding.house_ai_id == house_ai_id,
+                            HouseAIMatchSideBinding.house_ai_version == house_ai_version,
+                        )
+                    )
+                ) or "",
+            )
+        except HouseAIArtifactError as exc:
+            raise WorkerProtocolError(409, exc.code) from exc
+        house_identity = (house_ai_id, house_ai_version)
+        house_version_row = await db.get(HouseAIVersion, house_identity)
+        if house_version_row is None or house_version_row.frozen_at is None:
+            raise WorkerProtocolError(409, "HOUSE_AI_VERSION_NOT_FROZEN")
+        execution_kind = ExecutionKind.HOUSE_AI
+        artifact_digest = house_artifact.digest
+        artifact_ref = house_artifact.storage_ref
+        runtime_profile = house_version_row.runtime_profile
+        protocol_version = house_version_row.protocol_version
+        participant_id = None
+        submission_id = None
+        version_number = None
+    if match_id is not None:
+        match = await db.get(Match, match_id)
+        if match is None or match.state not in {MatchState.QUEUED, MatchState.STARTING}:
+            raise WorkerProtocolError(409, "MATCH_NOT_QUEUEABLE")
+        if execution_kind == ExecutionKind.HOUSE_AI and match.purpose != MatchPurpose.DEVELOPMENT:
+            raise WorkerProtocolError(409, "HOUSE_AI_PURPOSE_INVALID")
+        if match.purpose == MatchPurpose.DEVELOPMENT:
+            policy = await db.get(
+                DevelopmentMatchPolicy, (match.policy_id, match.policy_version)
+            )
+            if policy is None or policy.policy_digest != match.policy_digest:
+                raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_MISMATCH")
+            canonical_policy = json.dumps(
+                policy.policy_document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            if hashlib.sha256(canonical_policy).hexdigest() != policy.policy_digest:
+                raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_INTEGRITY_FAILURE")
+            expected_state = {
+                "match_id": str(match.id),
+                "purpose": match.purpose.value,
+                "match_seed": match.match_seed,
+                "initial_fen": match.initial_fen,
+                "protocol_version": match.protocol_version,
+                "runtime_profile": match.runtime_profile,
+                "rules_version": match.rules_version,
+                "policy_id": match.policy_id,
+                "policy_version": match.policy_version,
+                "policy_digest": match.policy_digest,
+                "initial_clock_ms": match.initial_clock_ms,
+                "increment_ms": match.increment_ms,
+                "move_timeout_ms": match.move_timeout_ms,
+            }
+            if initial_state != expected_state:
+                raise WorkerProtocolError(409, "DEVELOPMENT_INITIAL_STATE_MISMATCH")
+            if resource_policy.model_dump(mode="json") != policy.policy_document.get("resources"):
+                raise WorkerProtocolError(409, "DEVELOPMENT_RESOURCE_POLICY_MISMATCH")
+            if (
+                protocol_version != match.protocol_version
+                or runtime_profile != match.runtime_profile
+            ):
+                raise WorkerProtocolError(409, "DEVELOPMENT_RUNTIME_IDENTITY_MISMATCH")
+            if execution_kind == ExecutionKind.HOUSE_AI and (
+                house_version_row.rules_version != match.rules_version
+                or house_version_row.policy_version != match.policy_version
+                or house_version_row.policy_digest != match.policy_digest
+            ):
+                raise WorkerProtocolError(409, "DEVELOPMENT_HOUSE_AI_POLICY_MISMATCH")
+        if execution_kind == ExecutionKind.PARTICIPANT:
+            side = await db.scalar(
+                select(MatchSide)
+                .join(ParticipantMatchSideBinding,
+                      ParticipantMatchSideBinding.match_side_id == MatchSide.id)
+                .where(
+                    MatchSide.match_id == match_id,
+                    MatchSide.kind == MatchSideKind.PARTICIPANT,
+                    ParticipantMatchSideBinding.submission_version_id == submission_version_id,
+                    ParticipantMatchSideBinding.artifact_sha256 == artifact_digest,
+                )
+            )
+        else:
+            side = await db.scalar(
+                select(MatchSide)
+                .join(HouseAIMatchSideBinding,
+                      HouseAIMatchSideBinding.match_side_id == MatchSide.id)
+                .where(
+                    MatchSide.match_id == match_id,
+                    MatchSide.kind == MatchSideKind.HOUSE_AI,
+                    HouseAIMatchSideBinding.house_ai_id == house_identity[0],
+                    HouseAIMatchSideBinding.house_ai_version == house_identity[1],
+                    HouseAIMatchSideBinding.artifact_sha256 == artifact_digest,
+                )
+            )
+        if side is None:
+            raise WorkerProtocolError(409, "MATCH_SIDE_SUBJECT_MISMATCH")
     try:
         payload = json.dumps(initial_state, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
@@ -396,16 +553,18 @@ async def create_execution_job(
     job = WorkerExecutionJob(
         execution_id=uuid.uuid4(),
         match_id=match_id,
-        execution_kind=ExecutionKind.PARTICIPANT,
-        participant_id=version.participant_id,
-        submission_id=version.submission_id,
-        submission_version=version.version,
-        submission_version_id=version.id,
-        artifact_sha256=version.artifact_sha256,
-        immutable_artifact_ref=version.storage_key,
-        runtime_profile=version.runtime_profile or "python-3.12",
-        protocol_version=version.protocol_version or "aik-jsonl/1",
-        execution_mode="MOCK_PROTOCOL_ONLY",
+        execution_kind=execution_kind,
+        participant_id=participant_id,
+        submission_id=submission_id,
+        submission_version=version_number,
+        submission_version_id=version.id if version is not None else None,
+        house_ai_id=house_ai_id,
+        house_ai_version=house_ai_version,
+        artifact_sha256=artifact_digest,
+        immutable_artifact_ref=artifact_ref,
+        runtime_profile=runtime_profile,
+        protocol_version=protocol_version,
+        execution_mode=execution_mode,
         initial_state=initial_state,
         resource_policy=resource_policy.model_dump(mode="json"),
         execution_expires_at=expires,
@@ -417,11 +576,187 @@ async def create_execution_job(
     db.add(_audit(
         event_type="WORKER_EXECUTION_QUEUED", actor_id="control-plane",
         execution_id=job.execution_id,
-        details={"artifact_sha256": job.artifact_sha256, "mode": "PROTOCOL_MOCK_ONLY"},
+        details={
+            "execution_kind": job.execution_kind.value,
+            "artifact_sha256": job.artifact_sha256,
+            "mode": execution_mode,
+        },
     ))
-    await db.commit()
-    await db.refresh(job)
+    if commit:
+        await db.commit()
+        await db.refresh(job)
+    else:
+        await db.flush()
     return job
+
+
+async def dispatch_development_match_jobs(
+    db: AsyncSession, *, match_id: uuid.UUID
+) -> tuple[WorkerExecutionJob, WorkerExecutionJob]:
+    """Atomically create the current participant and House AI jobs for a queued match.
+
+    The partial unique index on (match_id, execution_kind) is the concurrency
+    backstop. Terminal jobs are historical attempts and do not block a retry.
+    """
+    match = (
+        await db.execute(select(Match).where(Match.id == match_id).with_for_update())
+    ).scalar_one_or_none()
+    if match is None:
+        raise WorkerProtocolError(404, "MATCH_NOT_FOUND")
+    if match.purpose != MatchPurpose.DEVELOPMENT:
+        raise WorkerProtocolError(409, "DEVELOPMENT_MATCH_REQUIRED")
+    if match.state != MatchState.QUEUED:
+        raise WorkerProtocolError(409, "MATCH_NOT_QUEUED")
+
+    sides = (
+        await db.execute(
+            select(MatchSide)
+            .where(MatchSide.match_id == match.id)
+            .order_by(MatchSide.kind)
+            .with_for_update()
+        )
+    ).scalars().all()
+    by_kind = {side.kind: side for side in sides}
+    if len(sides) != 2 or set(by_kind) != {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI}:
+        raise WorkerProtocolError(409, "MATCH_SIDE_COMPOSITION_INVALID")
+    participant_side = by_kind[MatchSideKind.PARTICIPANT]
+    house_side = by_kind[MatchSideKind.HOUSE_AI]
+    participant_binding = participant_side.participant_binding
+    house_binding = house_side.house_ai_binding
+    if participant_binding is None or house_binding is None:
+        raise WorkerProtocolError(409, "MATCH_SIDE_IDENTITY_MISSING")
+
+    participant_version = await db.scalar(
+        select(SubmissionVersion)
+        .where(SubmissionVersion.id == participant_binding.submission_version_id)
+        .with_for_update()
+    )
+    if (
+        participant_version is None
+        or participant_version.state != ArtifactState.ELIGIBLE
+        or participant_version.artifact_sha256 != participant_binding.artifact_sha256
+        or participant_version.participant_id != participant_binding.participant_id
+        or participant_version.submission_id != participant_binding.submission_id
+    ):
+        raise WorkerProtocolError(409, "PARTICIPANT_MATCH_SUBJECT_INVALID")
+    house_version = await db.get(
+        HouseAIVersion, (house_binding.house_ai_id, house_binding.house_ai_version)
+    )
+    if (
+        house_version is None
+        or house_version.frozen_at is None
+        or house_version.artifact_sha256 != house_binding.artifact_sha256
+    ):
+        raise WorkerProtocolError(409, "HOUSE_AI_MATCH_SUBJECT_INVALID")
+    if any(
+        side.protocol_version != match.protocol_version
+        or side.runtime_profile != match.runtime_profile
+        for side in sides
+    ):
+        raise WorkerProtocolError(409, "MATCH_RUNTIME_IDENTITY_INVALID")
+    policy = await db.get(DevelopmentMatchPolicy, (match.policy_id, match.policy_version))
+    if (
+        policy is None
+        or policy.policy_digest != match.policy_digest
+        or participant_version.protocol_version != match.protocol_version
+        or participant_version.runtime_profile != match.runtime_profile
+        or house_version.protocol_version != match.protocol_version
+        or house_version.runtime_profile != match.runtime_profile
+        or house_version.rules_version != match.rules_version
+        or house_version.policy_version != match.policy_version
+        or house_version.policy_digest != match.policy_digest
+    ):
+        raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_MISMATCH")
+    canonical_policy = json.dumps(
+        policy.policy_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    if hashlib.sha256(canonical_policy).hexdigest() != policy.policy_digest:
+        raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_INTEGRITY_FAILURE")
+    try:
+        resources = ResourcePolicy.model_validate(policy.policy_document["resources"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkerProtocolError(409, "DEVELOPMENT_RESOURCE_POLICY_INVALID") from exc
+    initial_state = {
+        "match_id": str(match.id),
+        "purpose": match.purpose.value,
+        "match_seed": match.match_seed,
+        "initial_fen": match.initial_fen,
+        "protocol_version": match.protocol_version,
+        "runtime_profile": match.runtime_profile,
+        "rules_version": match.rules_version,
+        "policy_id": match.policy_id,
+        "policy_version": match.policy_version,
+        "policy_digest": match.policy_digest,
+        "initial_clock_ms": match.initial_clock_ms,
+        "increment_ms": match.increment_ms,
+        "move_timeout_ms": match.move_timeout_ms,
+    }
+    expires = _now() + timedelta(milliseconds=resources.process_lifetime_ms)
+
+    current = (
+        await db.execute(
+            select(WorkerExecutionJob)
+            .where(
+                WorkerExecutionJob.match_id == match.id,
+                WorkerExecutionJob.status.in_([
+                    ExecutionJobStatus.QUEUED,
+                    ExecutionJobStatus.LEASED,
+                    ExecutionJobStatus.ACKNOWLEDGED,
+                    ExecutionJobStatus.CLEANUP_REPORTED,
+                ]),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    by_kind_jobs = {job.execution_kind: job for job in current}
+    if len(current) != len(by_kind_jobs) or set(by_kind_jobs) - {
+        ExecutionKind.PARTICIPANT, ExecutionKind.HOUSE_AI
+    }:
+        raise WorkerProtocolError(409, "MATCH_CURRENT_JOB_SET_INVALID")
+
+    async def ensure_job(kind: ExecutionKind) -> WorkerExecutionJob:
+        existing = by_kind_jobs.get(kind)
+        if existing is not None:
+            expected_side = participant_side if kind == ExecutionKind.PARTICIPANT else house_side
+            expected_digest = expected_side.artifact_sha256
+            if (
+                existing.artifact_sha256 != expected_digest
+                or existing.protocol_version != expected_side.protocol_version
+                or existing.runtime_profile != expected_side.runtime_profile
+                or existing.initial_state != initial_state
+                or existing.resource_policy != resources.model_dump(mode="json")
+            ):
+                raise WorkerProtocolError(409, "MATCH_CURRENT_JOB_MISMATCH")
+            return existing
+        if kind == ExecutionKind.PARTICIPANT:
+            return await create_execution_job(
+                db,
+                submission_version_id=participant_version.id,
+                initial_state=initial_state,
+                resource_policy=resources,
+                execution_expires_at=expires,
+                match_id=match.id,
+                execution_mode="KATA_AI_EXECUTION",
+                commit=False,
+            )
+        return await create_execution_job(
+            db,
+            house_ai_id=house_binding.house_ai_id,
+            house_ai_version=house_binding.house_ai_version,
+            initial_state=initial_state,
+            resource_policy=resources,
+            execution_expires_at=expires,
+            match_id=match.id,
+            execution_mode="KATA_AI_EXECUTION",
+            commit=False,
+        )
+
+    participant_job = await ensure_job(ExecutionKind.PARTICIPANT)
+    house_job = await ensure_job(ExecutionKind.HOUSE_AI)
+    await db.commit()
+    await db.refresh(participant_job)
+    await db.refresh(house_job)
+    return participant_job, house_job
 
 
 def _lease_valid(job: WorkerExecutionJob, worker: Worker, lease_id: uuid.UUID, fence: int) -> None:
@@ -455,13 +790,51 @@ def _next_sequence(job: WorkerExecutionJob, sequence: int, operation: dict) -> N
 async def claim_job(
     db: AsyncSession, *, worker: Worker
 ) -> WorkerExecutionJob | None:
+    if worker.status != WorkerStatus.ACTIVE or worker.revoked_at is not None:
+        raise WorkerProtocolError(403, "WORKER_NOT_ACTIVE")
     now = _now()
+    active_job = aliased(WorkerExecutionJob)
+    same_match_job = aliased(WorkerExecutionJob)
     candidate = (
         await db.execute(
             select(WorkerExecutionJob)
             .where(
                 WorkerExecutionJob.execution_expires_at > now,
-                WorkerExecutionJob.execution_kind == ExecutionKind.PARTICIPANT,
+                not_(
+                    select(active_job.id)
+                    .where(
+                        active_job.assigned_worker_id == worker.worker_id,
+                        active_job.status.in_([
+                            ExecutionJobStatus.LEASED,
+                            ExecutionJobStatus.ACKNOWLEDGED,
+                            ExecutionJobStatus.CLEANUP_REPORTED,
+                        ]),
+                        active_job.lease_expires_at > now,
+                    )
+                    .exists()
+                ),
+                and_(
+                    WorkerExecutionJob.match_id.is_not(None),
+                    not_(
+                        select(same_match_job.id)
+                        .where(
+                            same_match_job.match_id == WorkerExecutionJob.match_id,
+                            same_match_job.assigned_worker_id == worker.worker_id,
+                        )
+                        .exists()
+                    ),
+                )
+                | WorkerExecutionJob.match_id.is_(None),
+                (
+                    WorkerExecutionJob.match_id.is_(None)
+                    if worker.capabilities.get("sandbox_backend") != "KATA"
+                    else WorkerExecutionJob.protocol_version.in_(
+                        worker.capabilities.get("protocol_versions", [])
+                    )
+                ),
+                WorkerExecutionJob.execution_mode.in_(
+                    worker.capabilities.get("execution_modes", ["MOCK_PROTOCOL_ONLY"])
+                ),
                 (
                     (WorkerExecutionJob.status == ExecutionJobStatus.QUEUED)
                     | (
@@ -567,25 +940,49 @@ async def issue_artifact_capability(
         db, worker=worker, execution_id=execution_id, lease_id=lease_id,
         fencing_token=fencing_token,
     )
-    if job.execution_kind != ExecutionKind.PARTICIPANT:
-        raise WorkerProtocolError(403, "EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
     _next_sequence(job, sequence, {"op": "artifact_capability"})
     if job.status != ExecutionJobStatus.ACKNOWLEDGED:
         raise WorkerProtocolError(409, "JOB_NOT_ACKNOWLEDGED")
-    if not job.immutable_artifact_ref.startswith("sha256:"):
-        raise WorkerProtocolError(409, "ARTIFACT_REFERENCE_INVALID")
-    record = await db.get(QuarantineObject, job.artifact_sha256)
-    if record is None or record.artifact_sha256 != job.artifact_sha256:
-        raise WorkerProtocolError(409, "ARTIFACT_UNAVAILABLE")
+    house_ai_id = None
+    house_ai_version = None
+    if job.execution_kind == ExecutionKind.PARTICIPANT:
+        if job.submission_version_id is None or not job.immutable_artifact_ref.startswith(
+            "sha256:"
+        ):
+            raise WorkerProtocolError(409, "ARTIFACT_REFERENCE_INVALID")
+        record = await db.get(QuarantineObject, job.artifact_sha256)
+        if record is None or record.artifact_sha256 != job.artifact_sha256:
+            raise WorkerProtocolError(409, "ARTIFACT_UNAVAILABLE")
+    elif job.execution_kind == ExecutionKind.HOUSE_AI:
+        house_ai_id = job.house_ai_id
+        house_ai_version = job.house_ai_version
+        try:
+            artifact = await resolve_house_ai_artifact(
+                db,
+                house_ai_id=house_ai_id or "",
+                version=house_ai_version or 0,
+                expected_digest=job.artifact_sha256,
+            )
+        except HouseAIArtifactError as exc:
+            raise WorkerProtocolError(409, exc.code) from exc
+        if job.immutable_artifact_ref != artifact.storage_ref:
+            raise WorkerProtocolError(409, "ARTIFACT_REFERENCE_INVALID")
+    else:
+        raise WorkerProtocolError(403, "EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
     raw_capability = secrets.token_urlsafe(32)
     cap = WorkerArtifactCapability(
         token_hash=_hash_token(raw_capability), worker_id=worker.worker_id,
         execution_id=execution_id, lease_id=lease_id, fencing_token=fencing_token,
         artifact_sha256=job.artifact_sha256,
+        execution_kind=job.execution_kind,
         submission_version_id=job.submission_version_id,
+        house_ai_id=house_ai_id,
+        house_ai_version=house_ai_version,
         operation="DOWNLOAD_ARCHIVE",
         expires_at=min(
-            _normal(job.execution_expires_at), _now() + timedelta(seconds=CAPABILITY_SECONDS)
+            _normal(job.execution_expires_at),
+            _normal(job.lease_expires_at),
+            _now() + timedelta(seconds=CAPABILITY_SECONDS),
         ),
         max_uses=1, use_count=0,
     )
@@ -607,8 +1004,6 @@ async def download_authorized_artifact(
         db, worker=worker, execution_id=execution_id, lease_id=lease_id,
         fencing_token=fencing_token,
     )
-    if job.execution_kind != ExecutionKind.PARTICIPANT:
-        raise WorkerProtocolError(403, "EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
     cap = (
         await db.execute(
             select(WorkerArtifactCapability)
@@ -625,7 +1020,10 @@ async def download_authorized_artifact(
         or cap.lease_id != lease_id
         or cap.fencing_token != fencing_token
         or cap.artifact_sha256 != job.artifact_sha256
+        or cap.execution_kind != job.execution_kind
         or cap.submission_version_id != job.submission_version_id
+        or cap.house_ai_id != job.house_ai_id
+        or cap.house_ai_version != job.house_ai_version
         or cap.operation != "DOWNLOAD_ARCHIVE"
     ):
         raise WorkerProtocolError(403, "ARTIFACT_CAPABILITY_SCOPE_MISMATCH")
@@ -636,11 +1034,26 @@ async def download_authorized_artifact(
     _next_sequence(job, sequence, {"op": "artifact_download", "capability_id": str(cap.id)})
     cap.use_count += 1
     try:
-        content = await quarantine_storage.verify(
-            db, job.immutable_artifact_ref, job.artifact_sha256,
-            (await db.get(SubmissionVersion, job.submission_version_id)).artifact_size,
-        )
-    except (ValueError, AttributeError) as exc:
+        if job.execution_kind == ExecutionKind.PARTICIPANT:
+            version = await db.get(SubmissionVersion, job.submission_version_id)
+            if version is None:
+                raise ValueError("SUBMISSION_VERSION_MISSING")
+            content = await quarantine_storage.verify(
+                db, job.immutable_artifact_ref, job.artifact_sha256, version.artifact_size
+            )
+        elif job.execution_kind == ExecutionKind.HOUSE_AI:
+            artifact = await resolve_house_ai_artifact(
+                db,
+                house_ai_id=job.house_ai_id or "",
+                version=job.house_ai_version or 0,
+                expected_digest=job.artifact_sha256,
+            )
+            if job.immutable_artifact_ref != artifact.storage_ref:
+                raise ValueError("ARTIFACT_REFERENCE_INVALID")
+            content = artifact.archive_bytes
+        else:
+            raise ValueError("EXECUTION_ARTIFACT_KIND_UNSUPPORTED")
+    except (ValueError, AttributeError, HouseAIArtifactError) as exc:
         job.status = ExecutionJobStatus.FAILED
         cap.revoked_at = now
         db.add(_audit(

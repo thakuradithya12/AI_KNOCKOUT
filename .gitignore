@@ -84,3 +84,5 @@ temp/
 scratch/
 
 .venv-verify/
+backend/.venv-pg-verify/
+.venv-pg-verify/

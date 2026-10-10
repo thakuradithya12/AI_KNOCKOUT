@@ -94,7 +94,7 @@ def test_pg01_fresh_migrations_and_pg02_legacy_backfill():
                 (uuid.uuid4(), match_id, color, subject["participant_id"],
                  subject["submission_id"], subject["version_id"], subject["digest"]),
             )
-    _alembic(admin_url, "aik_verify_backfill", "head")
+    _alembic(admin_url, "aik_verify_backfill", "0008_typed_match_sides")
     with psycopg2.connect(backfill_url) as migrated:
         cursor = migrated.cursor()
         cursor.execute(
@@ -119,7 +119,10 @@ def test_pg01_fresh_migrations_and_pg02_legacy_backfill():
         )
         assert cursor.fetchone()[0] == "PEER_TEST"
         cursor.execute(
-            "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='match_sides' AND column_name IN ('participant_id','submission_id','submission_version_id','artifact_sha256')"
+            "SELECT count(*) FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name='match_sides' "
+            "AND column_name IN ('participant_id','submission_id','submission_version_id',"
+            "'artifact_sha256')"
         )
         assert cursor.fetchone()[0] == 0
     print("PG-02: PASS")
@@ -129,17 +132,17 @@ def test_pg01_fresh_migrations_and_pg02_legacy_backfill():
     cur.execute("DROP DATABASE aik_verify_backfill WITH (FORCE)")
     cur.execute("DROP ROLE aik_worker_gateway")
     cur.execute("CREATE DATABASE aik_verify_empty")
-    _alembic(admin_url, "aik_verify_empty", "head")
+    _alembic(admin_url, "aik_verify_empty", "0008_typed_match_sides")
     with psycopg2.connect(_db_url(admin_url, "aik_verify_empty")) as empty:
         cursor = empty.cursor()
         cursor.execute("SELECT version_num FROM alembic_version")
         assert cursor.fetchone()[0] == "0008_typed_match_sides"
     print("PG-01: PASS")
 
-    # The container's explicitly-created `aik_verify` database is the empty
-    # target for the trigger matrix; migrate it after removing the one global
-    # role left by the independent PG-01 scenario.
+    # Create the isolated empty target for the trigger matrix after removing
+    # the one global role left by the independent PG-01 scenario.
     cur.execute("DROP DATABASE aik_verify_empty WITH (FORCE)")
     cur.execute("DROP ROLE aik_worker_gateway")
-    _alembic(admin_url, "aik_verify", "head")
+    cur.execute("CREATE DATABASE aik_verify")
+    _alembic(admin_url, "aik_verify", "0008_typed_match_sides")
     admin.close()

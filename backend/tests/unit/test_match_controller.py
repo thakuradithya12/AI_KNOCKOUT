@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import replace
@@ -22,7 +23,8 @@ from app.matches.controller import (
     position_identity,
     reconstruct_position,
 )
-from app.models.match import MatchFailure, MatchOutcome, MatchSideColor, MatchState
+from app.matches.coordinator import CoordinatorError, ExecutionAuthority, MatchCoordinator
+from app.models.match import MatchFailure, MatchOutcome, MatchSideColor, MatchSideKind, MatchState
 from app.sandbox.contract import AIKMessage, AIKProtocolError, AIKTransport
 
 
@@ -146,6 +148,62 @@ def proposal(request_id: str, move: str) -> AIKMessage:
         ).encode()
         + b"\n",
     )
+
+
+def test_server_coordinator_owns_controller_and_rejects_wrong_worker():
+    async def run():
+        controller, _ = make_controller()
+        black = controller.sides[MatchSideColor.BLACK]
+        controller.sides[MatchSideColor.BLACK] = replace(
+            black,
+            kind=MatchSideKind.HOUSE_AI,
+            participant_id=None,
+            submission_id=None,
+            submission_version_id=None,
+            house_ai_id="house-fixed",
+            house_ai_version=1,
+        )
+        binding = controller.bindings[MatchSideColor.BLACK]
+        controller.bindings[MatchSideColor.BLACK] = replace(
+            binding,
+            kind=MatchSideKind.HOUSE_AI,
+            submission_version_id=None,
+            house_ai_id="house-fixed",
+            house_ai_version=1,
+        )
+        persisted = []
+
+        async def persist(value):
+            persisted.append(value)
+
+        coordinator = MatchCoordinator(persist)
+        coordinator.register(controller)
+        authority = ExecutionAuthority(
+            match_id=controller.match_id,
+            side_id=controller.sides[MatchSideColor.WHITE].side_id,
+            execution_id=controller.bindings[MatchSideColor.WHITE].execution_id,
+            worker_id="wrong-worker",
+            lease_id=controller.bindings[MatchSideColor.WHITE].lease_id,
+            fence=1,
+            attempt=1,
+            side=MatchSideColor.WHITE,
+        )
+        with pytest.raises(CoordinatorError, match="EXECUTION_AUTHORITY_MISMATCH"):
+            await coordinator.next_command(authority)
+
+        good = replace(authority, worker_id="worker-white")
+        command = await coordinator.next_command(good)
+        assert command is not None and command.command_type == "HELLO"
+        response = (
+            '{"protocol_version":"aik-jsonl/1","type":"ready",'
+            f'"request_id":"{command.command_id}"}}\n'
+        ).encode()
+        await coordinator.submit_response(good, command_id=command.command_id, payload=response)
+        assert persisted == [controller]
+        assert controller in [coordinator.controller_for_testing(controller.match_id)]
+        assert controller.hello_ready == {MatchSideColor.WHITE}
+
+    asyncio.run(run())
 
 
 def ack(request_id: str, response_type: str = "ack") -> AIKMessage:

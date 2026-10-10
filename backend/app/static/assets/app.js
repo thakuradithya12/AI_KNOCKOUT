@@ -1,5 +1,5 @@
-import { api, ApiError } from "/assets/api.js";
-import { copyCredentialValue, credentialPasteValues, credentialsText } from "/assets/credentials.js";
+import { api, ApiError } from "/assets/api.js?v=ui-20261007-5";
+import { copyCredentialValue, credentialPasteValues, credentialsText } from "/assets/credentials.js?v=ui-20261007-5";
 
 const app = document.querySelector("#app");
 const serverLabel = document.querySelector("#server-label");
@@ -38,6 +38,7 @@ checkServer();
 setInterval(checkServer, 30000);
 
 function landing(active = "login", error = "") {
+  document.body.classList.remove("public-interface");
   route = active;
   const registering = active === "register";
   app.innerHTML = `
@@ -51,6 +52,7 @@ function landing(active = "login", error = "") {
           <div><dt>Competition</dt><dd>Technical chess</dd></div>
           <div><dt>Access</dt><dd>Participants</dd></div>
         </dl>
+        <nav class="access-views" aria-label="Other AI Knockout interfaces"><button class="link-button" type="button" data-view="arena">Live Arena →</button><button class="link-button" type="button" data-view="admin">Admin Control Center →</button></nav>
         ${competitionDiagram()}
       </div>
       <section class="access-panel" aria-label="${registering ? "Register participant" : "Sign in"}">
@@ -63,6 +65,7 @@ function landing(active = "login", error = "") {
       </section>
     </section>`;
   app.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => landing(button.dataset.page)));
+  app.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => renderPublicView(button.dataset.view)));
   app.querySelector("form").addEventListener("submit", registering ? register : login);
   if (!registering) bindCredentialPaste();
 }
@@ -192,219 +195,523 @@ async function login(event) {
   });
 }
 
-function dashboard(participant) {
-  route = "dashboard";
-  clearInterval(buildClockTimer);
-  buildClockTimer = null;
-  app.innerHTML = `<section class="dashboard-head"><div><div class="section-index">AI KNOCKOUT <span>PARTICIPANT SYSTEM</span></div><h1 id="welcome">${esc(participant.name)}</h1><div class="identity-line"><span>Participant ID</span><code>${esc(participant.participant_id)}</code><span class="status-tag status-active">${esc(participant.status)}</span></div></div><div class="account-controls"><button class="button button-quiet" id="refresh" type="button">Refresh profile</button><button class="button button-quiet" data-signout type="button">Sign out</button></div></section>
-    ${sectionNav("overview")}
-    <section class="competition-state" aria-labelledby="competition-state-title">
-      <div class="section-heading"><h2 id="competition-state-title">Current competition state</h2><span>Profile and service availability</span></div>
-      <div class="competition-state-grid">
-        <article class="state-card state-card-primary"><span class="state-label">Participant</span><strong><span class="status-tag status-active">${esc(participant.status)}</span></strong><p>Status from your participant profile.</p></article>
-        <article class="state-card"><span class="state-label">Build session</span><strong id="build-elapsed" class="unavailable">Loading</strong><p id="build-started">Server clock loading</p></article>
-        <article class="state-card"><span class="state-label">Latest submission</span><strong id="submission-state" class="unavailable">Not submitted</strong><p id="submission-detail">No submission version is recorded.</p></article>
-        <article class="state-card"><span class="state-label">Validation</span><strong id="validation-state" class="unavailable">Not run</strong><p>Static validation status from the server.</p></article>
-        <article class="state-card"><span class="state-label">Development match</span><strong class="unavailable">Unavailable</strong><p>House AI match execution is not implemented.</p></article>
-      </div>
-    </section>
-    <section class="overview-grid">
-      <div class="overview-main">
-        <section class="data-section services-section"><div class="section-heading"><h2>Competition services</h2><span>Availability</span></div>
-          <div class="service-row"><div><h3>Submissions & validation</h3><p>Version history, static validation, eligibility, receipt time, and build duration are server-backed.</p></div><span class="status-tag status-active">Available</span></div>
-          <div class="service-row"><div><h3>Official submission</h3><p id="official-submission-detail">Selection status loading.</p><button class="button button-quiet hidden" id="select-official" type="button">Select latest eligible version</button></div><span class="status-tag status-unavailable" id="official-submission-state">Loading</span></div>
-          <div class="service-row"><div><h3>Development matches</h3><p>House AI identity is a future contract; match execution and development scoring are not implemented.</p></div><span class="status-tag status-unavailable">Unavailable</span></div>
-        </section>
-      </div>
-      <aside class="identity-panel" aria-labelledby="identity-title"><div class="section-heading"><h2 id="identity-title">My AI</h2><span>Server identity</span></div>
-        <div class="identity-name">${esc(participant.name)}</div>
-        <dl class="identity-facts"><div><dt>Participant ID</dt><dd>${esc(participant.participant_id)}</dd></div><div><dt>Team</dt><dd>${participant.team_name ? esc(participant.team_name) : "Not provided"}</dd></div><div><dt>Account status</dt><dd><span class="status-tag status-active">${esc(participant.status)}</span></dd></div></dl>
-      </aside>
-    </section>
-    <section class="activity-panel" aria-labelledby="activity-title"><div class="section-heading"><h2 id="activity-title">Recent activity</h2><span>Event timeline</span></div><div class="activity-empty"><span class="activity-mark" aria-hidden="true">—</span><div><strong>Activity data unavailable</strong><p>The server does not provide a participant activity or event timeline endpoint yet.</p></div></div></section>`;
-  app.querySelector("#refresh").addEventListener("click", loadProfile);
-  app.querySelector("[data-signout]").addEventListener("click", signOut);
-  app.querySelector("#select-official").addEventListener("click", selectLatestOfficial);
-  bindSectionNav(participant);
+const portalSections = [
+  ["overview", "Overview", "overview"], ["build", "Build", "build"], ["submit", "Submit", "submit"],
+  ["matches", "Matches", "matches"], ["results", "Results", "results"], ["profile", "Profile", "profile"],
+];
+let activeParticipant = null;
+
+function navIcon(name) {
+  const paths = {
+    overview: '<rect x="3.5" y="3.5" width="7" height="7" rx="1"/><rect x="13.5" y="3.5" width="7" height="7" rx="1"/><rect x="3.5" y="13.5" width="7" height="7" rx="1"/><rect x="13.5" y="13.5" width="7" height="7" rx="1"/>',
+    build: '<path d="m8 7-4 5 4 5M16 7l4 5-4 5M14 5l-4 14"/>',
+    submit: '<path d="M12 15V3m0 0L7.5 7.5M12 3l4.5 4.5M4 14v5a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-5"/>',
+    matches: '<path d="M7 20h10M9 20v-3l-3-2 2-3-2-3 3-4 4 1 2 4-2 2 3 2 1 4h-5"/><circle cx="13" cy="8" r=".7"/>',
+    results: '<path d="M7 4h10v4a5 5 0 0 1-10 0V4ZM7 6H4v2a4 4 0 0 0 4 4m9-6h3v2a4 4 0 0 1-4 4m-4 1v4m-4 3h8m-7-3h6"/>',
+    profile: '<circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>',
+    refresh: '<path d="M20 7v5h-5M4 17v-5h5"/><path d="M5.6 9a7 7 0 0 1 11.7-2L20 12M4 12l2.7 5a7 7 0 0 0 11.7-2"/>',
+  };
+  return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.overview}</svg>`;
 }
 
 function formatElapsed(totalSeconds) {
-  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const seconds = Math.max(0, Math.floor(totalSeconds || 0));
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+  return `${String(hours).padStart(2, "0")} : ${String(minutes).padStart(2, "0")} : ${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function renderEventStatus(status) {
-  const elapsed = document.querySelector("#build-elapsed");
-  if (!elapsed) return;
+function startElapsedClock(targetId, serverElapsedSeconds) {
+  const target = app.querySelector(`#${targetId}`);
+  if (!target || !Number.isFinite(Number(serverElapsedSeconds))) return;
+  const elapsedAtSample = Number(serverElapsedSeconds);
   const sampledAt = performance.now();
-  elapsed.textContent = formatElapsed(status.build_elapsed_seconds);
-  elapsed.classList.remove("unavailable");
-  const started = new Date(status.build_started_at);
-  document.querySelector("#build-started").textContent = `Started ${started.toLocaleString()} · server timestamp`;
-  buildClockTimer = setInterval(() => {
-    if (!document.querySelector("#build-elapsed")) return clearInterval(buildClockTimer);
-    elapsed.textContent = formatElapsed(status.build_elapsed_seconds + (performance.now() - sampledAt) / 1000);
-  }, 1000);
+  const update = () => {
+    if (!target.isConnected) {
+      clearInterval(buildClockTimer);
+      buildClockTimer = null;
+      return;
+    }
+    target.textContent = formatElapsed(elapsedAtSample + (performance.now() - sampledAt) / 1000);
+  };
+  clearInterval(buildClockTimer);
+  update();
+  buildClockTimer = setInterval(update, 1000);
+}
 
-  const latest = status.latest_submission;
-  const submission = document.querySelector("#submission-state");
-  const detail = document.querySelector("#submission-detail");
-  const validation = document.querySelector("#validation-state");
-  if (latest) {
-    submission.textContent = `Version ${latest.version} · ${latest.state}`;
-    submission.classList.remove("unavailable");
-    detail.textContent = `Received ${new Date(latest.submitted_at).toLocaleString()} · ${latest.build_duration_seconds ?? "—"}s build time`;
-    validation.textContent = latest.validation_outcome || "Pending";
-    validation.classList.remove("unavailable");
+function dateTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}
+
+function badge(value = "Unavailable") {
+  const key = String(value).toLowerCase();
+  const tone = key.includes("eligible") || key.includes("approved") || key === "active" || key === "completed"
+    ? "success" : key.includes("reject") || key.includes("fail") || key.includes("abort")
+      ? "danger" : key.includes("validat") || key.includes("queued") || key.includes("starting") || key.includes("running")
+        ? "warning" : "neutral";
+  return `<span class="status-badge ${tone}">${esc(value.replaceAll("_", " "))}</span>`;
+}
+
+function shell(participant, active, title, content) {
+  document.body.classList.remove("public-interface");
+  activeParticipant = participant;
+  route = active;
+  clearInterval(buildClockTimer);
+  buildClockTimer = null;
+  app.innerHTML = `<div class="portal-app">
+    <header class="topbar"><a class="brand" href="#overview" data-page="overview" aria-label="AI Knockout participant home"><span class="brand-mark">AI</span><span class="brand-word">KNOCKOUT<small>BY ENGINEERING COLLEGE</small></span></a>
+      <div class="topbar-actions"><span class="service-indicator ${serverState.classList.contains("online") ? "is-online" : ""}"><i></i>${serverState.classList.contains("online") ? "System online" : "Connection status"}</span><button class="icon-button" type="button" id="refresh" aria-label="Refresh current page" title="Refresh">${navIcon("refresh")}</button><span class="participant-chip"><span class="avatar">${esc((participant.name || "P").slice(0, 1).toUpperCase())}</span><span>${esc(participant.participant_id)}</span></span><button class="text-button" type="button" data-signout>Sign out</button></div>
+    </header>
+    <div class="portal-frame"><aside class="sidebar"><div class="sidebar-label">PARTICIPANT</div><nav class="side-nav" aria-label="Participant navigation">${portalSections.map(([key, label, icon]) => `<button type="button" class="side-link ${active === key ? "active" : ""}" data-page="${key}" ${active === key ? 'aria-current="page"' : ""}><span class="nav-icon">${navIcon(icon)}</span><span>${label}</span></button>`).join("")}</nav><div class="sidebar-spacer"></div><div class="side-account"><span class="avatar">${esc((participant.name || "P").slice(0, 1).toUpperCase())}</span><span><strong>${esc(participant.name)}</strong><small>Participant</small></span><button class="side-signout" type="button" data-signout aria-label="Sign out">⋯</button></div></aside>
+      <main class="page-main"><div class="page-wrap"><div class="page-heading"><div><div class="eyebrow">AI KNOCKOUT <span>/</span> PARTICIPANT</div><h1>${esc(title)}</h1></div>${active !== "overview" ? `<p class="page-id">${esc(participant.participant_id)}</p>` : ""}</div>${content}</div></main>
+    </div></div>`;
+  app.querySelectorAll("[data-signout]").forEach((button) => button.addEventListener("click", signOut));
+  app.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", (event) => {
+    event.preventDefault();
+    navigate(button.dataset.page, participant);
+  }));
+  app.querySelector("#refresh").addEventListener("click", () => navigate(active, participant));
+}
+
+function overviewMarkup(participant) {
+  return `<section class="hero-panel"><div class="hero-copy"><span class="phase-pill"><i></i> PARTICIPANT WORKSPACE</span><h2>Turn your ideas<br>into a stronger player.</h2><p>Train. Test. Submit. Compete.</p><div class="hero-clock"><span>BUILD SESSION ELAPSED</span><strong id="build-elapsed" aria-live="off">— : — : —</strong><small id="build-started">Loading server event status</small></div></div><div class="hero-board" aria-hidden="true"><div class="mini-board">${miniBoard()}</div><span class="board-caption">STANDARD CHESS · SERVER-LED</span></div></section>
+  <section class="competition-state" aria-labelledby="competition-state-heading"><div class="section-heading"><h2 id="competition-state-heading">Competition State</h2><span>Live participant record</span></div><div class="competition-state-grid"><article class="state-card"><span class="state-label">Participant</span><strong id="state-participant">Loading account state</strong><p>Server-issued account status</p></article><article class="state-card"><span class="state-label">AI submission</span><strong id="state-submission">Loading submission state</strong><p id="state-submission-note">Latest recorded package</p></article><article class="state-card"><span class="state-label">Validation</span><strong id="state-validation">Loading validation state</strong><p>Latest server validation outcome</p></article><article class="state-card"><span class="state-label">Next match</span><strong id="state-match">Loading match state</strong><p id="state-match-note">Development matches · not official</p></article></div></section>
+  <section class="feature-grid"><article class="card feature-card"><div class="card-heading"><h2>Your Submission</h2><span class="card-mark blue">↗</span></div><div id="overview-submission" class="loading-copy">Loading your latest server record…</div><div class="card-actions"><button class="button button-secondary" type="button" data-page="submit">Submit new version</button><button class="link-button" type="button" data-page="submit">View details →</button></div></article>
+  <article class="card feature-card"><div class="card-heading"><h2>Development Match</h2><span class="card-mark mint">${navIcon("matches")}</span></div><div id="overview-match" class="loading-copy">Checking your development matches…</div><div class="card-actions"><button class="button button-primary" id="request-match" type="button" disabled>Start development match <span aria-hidden="true">→</span></button><button class="link-button" type="button" data-page="matches">View matches →</button></div></article></section>
+  <section class="lower-grid"><article class="card"><div class="card-heading"><h2>Submission History</h2><button class="link-button" type="button" data-page="submit">All submissions →</button></div><div id="overview-history" class="table-loading">Loading server records…</div></article>
+    <article class="card"><div class="card-heading"><h2>Validation Results</h2><span class="card-mark mint">✓</span></div><div id="overview-validation" class="result-list"><p class="muted-copy">Validation evidence will appear for a selected submission version.</p></div></article>
+    <article class="card"><div class="card-heading"><h2>Development Stats</h2><span class="card-mark blue">▥</span></div><div class="unavailable-block"><strong>Not available yet</strong><p>The result API does not provide aggregate development statistics.</p></div></article></section>
+  <section class="official-strip card"><div><span class="eyebrow">OFFICIAL ENTRY</span><p id="official-detail">Loading event selection state…</p></div><div class="official-actions"><span id="official-state">${badge("Loading")}</span><button id="select-official" class="button button-secondary" type="button" hidden>Select eligible version</button></div></section>
+  <section class="activity-strip card"><div class="card-heading"><h2>Recent Activity</h2><span class="muted-label">Event timeline</span></div><div class="unavailable-inline"><span aria-hidden="true">—</span><p><strong>Activity feed unavailable</strong><br>The backend does not expose a participant activity timeline.</p></div></section>`;
+}
+
+function miniBoard() {
+  const rows = ["rnbqkbnr", "pppppppp", "........", "........", "........", "........", "PPPPPPPP", "RNBQKBNR"];
+  const pieces = { p: "♟", r: "♜", n: "♞", b: "♝", q: "♛", k: "♚", P: "♙", R: "♖", N: "♘", B: "♗", Q: "♕", K: "♔" };
+  return rows.map((row, rank) => [...row].map((piece, file) => `<span class="square ${(rank + file) % 2 ? "dark" : "light"}">${pieces[piece] || ""}</span>`).join("")).join("");
+}
+
+function dashboard(participant) {
+  shell(participant, "overview", "AI Command Deck", overviewMarkup(participant));
+  app.querySelector("#request-match").addEventListener("click", requestDevelopmentMatch);
+  app.querySelector("#select-official").addEventListener("click", selectLatestOfficial);
+  loadOverview(participant);
+}
+
+async function loadOverview(participant) {
+  try {
+    const [event, submissions] = await Promise.all([
+      api.eventStatus(sessionToken), api.submissions(sessionToken),
+    ]);
+    let matches = null;
+    try { matches = await api.developmentMatches(sessionToken); }
+    catch (error) {
+      if (error.status !== 404 && error.status !== 405) throw error;
+    }
+    if (route !== "overview") return;
+    startElapsedClock("build-elapsed", event.build_elapsed_seconds);
+    app.querySelector("#build-started").textContent = `Started ${dateTime(event.build_started_at)} · server time`;
+    const latest = event.latest_submission;
+    app.querySelector("#state-participant").innerHTML = badge(participant.status || "Status unavailable");
+    app.querySelector("#state-submission").innerHTML = latest ? badge(latest.state) : "No submission yet";
+    app.querySelector("#state-submission-note").textContent = latest
+      ? `Version ${latest.version} · received ${dateTime(latest.submitted_at)}`
+      : "Submit a package to begin validation";
+    app.querySelector("#state-validation").innerHTML = latest?.validation_outcome
+      ? badge(latest.validation_outcome)
+      : latest ? "No result recorded" : "Not started";
+    app.querySelector("#overview-submission").innerHTML = latest
+      ? `<div class="submission-summary"><span class="version-tile">v${esc(latest.version)}</span><div><strong>${esc(latest.state)}</strong><small>Received ${esc(dateTime(latest.submitted_at))}</small></div>${badge(latest.state)}</div><p class="summary-copy">${latest.build_duration_seconds == null ? "Build duration unavailable" : `${esc(latest.build_duration_seconds)} seconds recorded by the server`}</p>`
+      : `<div class="empty-card-copy"><strong>No submission yet</strong><p>Your first server-recorded package will appear here.</p></div>`;
+    const items = Array.isArray(matches?.items) ? matches.items : [];
+    const active = items.find((match) => ["QUEUED", "STARTING", "RUNNING"].includes(match.state));
+    const matchSummary = active || items[0];
+    app.querySelector("#state-match").textContent = active
+      ? active.state.replaceAll("_", " ")
+      : items.length ? "No active match" : matches ? "No match requested" : "Unavailable";
+    app.querySelector("#state-match-note").textContent = active
+      ? `Updated ${dateTime(active.started_at || active.created_at)}`
+      : matches ? "A development match can be requested when eligible" : "Match service data is unavailable";
+    app.querySelector("#overview-match").innerHTML = matchSummary
+      ? `<div class="submission-summary"><span class="match-mark">${navIcon("matches")}</span><div><strong>${esc(matchSummary.state.replaceAll("_", " "))}</strong><small>${active ? "Development match in progress" : `Last updated ${esc(dateTime(matchSummary.completed_at || matchSummary.created_at))}`}</small></div>${badge(matchSummary.state)}</div><p class="summary-copy">House AI ${esc(matchSummary.house_ai?.house_ai_id || "identity unavailable")} · Development only</p>`
+      : matches
+        ? `<div class="empty-card-copy"><strong>No development match requested</strong><p>Request one when an eligible submission version is available.</p></div>`
+        : `<div class="unavailable-block"><strong>Development match service unavailable</strong><p>This API instance does not expose development-match data.</p></div>`;
+    const requestButton = app.querySelector("#request-match");
+    requestButton.disabled = !matches || !latest || latest.state !== "ELIGIBLE" || Boolean(active);
+    requestButton.textContent = !matches ? "Match service unavailable" : active ? "Development match active" : latest?.state === "ELIGIBLE" ? "Start development match →" : "Eligible submission required";
+    renderHistory(submissions.items || [], event);
+    renderValidation(latest);
+    renderOfficialSelection(event);
+  } catch (error) {
+    if (handleSessionError(error)) return;
+    for (const selector of ["#overview-submission", "#overview-match", "#overview-history", "#overview-validation"]) {
+      const node = app.querySelector(selector);
+      if (node) node.textContent = "Server data unavailable. Refresh to try again.";
+    }
+    for (const selector of ["#state-participant", "#state-submission", "#state-validation", "#state-match"]) {
+      const node = app.querySelector(selector);
+      if (node) node.textContent = "Live data unavailable";
+    }
+    for (const selector of ["#state-submission-note", "#state-match-note"]) {
+      const node = app.querySelector(selector);
+      if (node) node.textContent = "Refresh to retrieve the latest server state.";
+    }
+    const started = app.querySelector("#build-started");
+    if (started) started.textContent = "Server event status unavailable.";
   }
+}
 
-  const officialTag = document.querySelector("#official-submission-state");
-  const officialDetail = document.querySelector("#official-submission-detail");
-  const selectButton = document.querySelector("#select-official");
-  if (status.official_frozen_at) {
-    officialTag.textContent = "Frozen";
-    officialDetail.textContent = status.official_submission
-      ? `Version ${status.official_submission.version} pinned at ${new Date(status.official_frozen_at).toLocaleString()}.`
-      : `Selection closed at ${new Date(status.official_frozen_at).toLocaleString()}.`;
-  } else if (status.official_submission) {
-    officialTag.textContent = "Selected";
-    officialDetail.textContent = `Version ${status.official_submission.version} is your intended official entry.`;
-    selectButton.textContent = "Update official version to latest eligible";
-    selectButton.classList.toggle("hidden", !latest || latest.state !== "ELIGIBLE");
+async function renderHistory(submissions, event) {
+  const target = app.querySelector("#overview-history");
+  if (!target) return;
+  const rows = [];
+  for (const submission of submissions.slice(0, 6)) {
+    try {
+      const versions = await api.submissionVersions(sessionToken, submission.submission_id);
+      for (const version of (versions.items || []).slice(0, 2)) rows.push(version);
+    } catch (error) {
+      if (handleSessionError(error)) return;
+    }
+  }
+  if (!rows.length) {
+    target.innerHTML = `<div class="empty-table-state">${submissions.length ? "No version records returned." : "No submissions recorded."}</div>`;
+    return;
+  }
+  target.innerHTML = `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Version</th><th>Status</th><th>Submitted</th></tr></thead><tbody>${rows.slice(0, 6).map((row) => `<tr><td>v${esc(row.version)}</td><td>${badge(row.state)}</td><td>${esc(dateTime(row.submitted_at))}</td></tr>`).join("")}</tbody></table></div>`;
+  if (event.latest_submission) target.dataset.latest = String(event.latest_submission.version);
+}
+
+async function renderValidation(latest) {
+  const target = app.querySelector("#overview-validation");
+  if (!target) return;
+  if (!latest) {
+    target.innerHTML = `<p class="muted-copy">Validation will appear after a package is submitted.</p>`;
+    return;
+  }
+  try {
+    const result = await api.validation(sessionToken, latest.submission_id, latest.version);
+    if (!target.isConnected) return;
+    if (!result.attempts?.length) {
+      target.innerHTML = `<p class="muted-copy">No validation attempts are recorded for version ${esc(latest.version)}.</p>`;
+      return;
+    }
+    target.innerHTML = result.attempts.slice(-5).reverse().map((attempt) => `<div class="validation-row"><span class="validation-check ${attempt.outcome === "PASSED" ? "ok" : attempt.outcome === "FAILED" ? "bad" : "pending"}">${attempt.outcome === "PASSED" ? "✓" : attempt.outcome === "FAILED" ? "!" : "·"}</span><span><strong>${esc(attempt.outcome.replaceAll("_", " "))}</strong><small>${esc(attempt.validator_version)} · ${esc(dateTime(attempt.completed_at || attempt.started_at))}</small></span></div>`).join("");
+  } catch (error) {
+    if (handleSessionError(error)) return;
+    target.textContent = "Validation details could not be loaded.";
+  }
+}
+
+function renderOfficialSelection(event) {
+  const detail = app.querySelector("#official-detail");
+  const state = app.querySelector("#official-state");
+  const button = app.querySelector("#select-official");
+  if (!detail || !state || !button) return;
+  const latest = event.latest_submission;
+  if (event.official_frozen_at) {
+    state.innerHTML = badge("Frozen");
+    detail.textContent = event.official_submission
+      ? `Version ${event.official_submission.version} was frozen on ${dateTime(event.official_frozen_at)}.`
+      : `Official selection closed on ${dateTime(event.official_frozen_at)}.`;
+  } else if (event.official_submission) {
+    state.innerHTML = badge("Selected");
+    detail.textContent = `Version ${event.official_submission.version} is currently selected as your official entry.`;
   } else {
-    officialTag.textContent = "Open";
-    officialDetail.textContent = "No official version selected. Only an eligible version can be selected.";
-    selectButton.textContent = "Select latest eligible version";
-    selectButton.classList.toggle("hidden", !latest || latest.state !== "ELIGIBLE");
+    state.innerHTML = badge("Not selected");
+    detail.textContent = "Choose an eligible version before the official freeze.";
   }
+  button.hidden = Boolean(event.official_frozen_at) || !latest || latest.state !== "ELIGIBLE";
 }
 
 async function selectLatestOfficial() {
-  const token = sessionToken;
-  if (!token) return landing("login");
   try {
-    const status = await api.eventStatus(token);
-    if (!status.latest_submission || status.latest_submission.state !== "ELIGIBLE") return;
-    await api.selectOfficialSubmission(token, {
-      submission_id: status.latest_submission.submission_id,
-      version: status.latest_submission.version,
-    });
-    await loadProfile();
+    const status = await api.eventStatus(sessionToken);
+    if (!status.latest_submission || status.latest_submission.state !== "ELIGIBLE") return notify("An eligible version is required.");
+    await api.selectOfficialSubmission(sessionToken, { submission_id: status.latest_submission.submission_id, version: status.latest_submission.version });
     notify("Official submission selection updated");
+    await loadProfile();
   } catch (error) {
-    if (error.status === 401 || error.status === 403) {
-      sessionToken = null;
-      landing("login", "Your session expired or was revoked. Sign in again.");
-    } else notify(error.message || "Could not update official submission");
+    if (!handleSessionError(error)) notify(error.message || "Could not update official submission");
   }
 }
 
-const portalSections = [["overview", "Overview"], ["identity", "My AI"], ["submission", "Submissions"], ["matches", "Matches"], ["viewer", "Live match"], ["leaderboard", "Leaderboard"], ["history", "History"]];
-function sectionNav(active) {
-  return `<nav class="portal-nav" aria-label="Participant sections">${portalSections.map(([key, label]) => `<button type="button" class="portal-link ${key === active ? "selected" : ""}" data-section="${key}">${label}</button>`).join("")}</nav>`;
+function navigate(section, participant = activeParticipant) {
+  if (!participant || !sessionToken) return landing("login");
+  switch (section) {
+    case "overview": dashboard(participant); break;
+    case "build": renderBuild(participant); break;
+    case "submit": renderSubmit(participant); break;
+    case "matches": renderMatches(participant); break;
+    case "results": renderResults(participant); break;
+    case "bracket": renderCompetitionUnavailable(participant, "bracket"); break;
+    case "leaderboard": renderCompetitionUnavailable(participant, "leaderboard"); break;
+    case "profile": renderProfile(participant); break;
+    default: dashboard(participant);
+  }
 }
-function bindSectionNav(participant) {
-  app.querySelectorAll("[data-section]").forEach(button => button.addEventListener("click", () => {
-    if (button.dataset.section === "overview") dashboard(participant);
-    else if (button.dataset.section === "submission") participantSubmissions(participant);
-    else unavailableSection(participant, button.dataset.section);
-  }));
+
+function renderPublicView(view) {
+  if (view === "admin") return renderAdminUnavailable();
+  renderArena("live");
 }
-async function participantSubmissions(participant) {
-  route = "submission";
-  app.innerHTML = `<section class="dashboard-head"><div><div class="section-index">AI KNOCKOUT <span>SUBMISSIONS</span></div><h1>Submissions</h1><div class="identity-line"><span>${esc(participant.name)}</span><code>${esc(participant.participant_id)}</code></div></div><div class="account-controls"><button class="button button-quiet" id="refresh" type="button">Refresh profile</button><button class="button button-quiet" data-signout type="button">Sign out</button></div></section>${sectionNav("submission")}<section class="empty-state"><div class="empty-code">SERVER SUBMISSION STATE</div><h2 id="submission-heading">Loading latest version…</h2><p id="submission-copy">Loading server-recorded version, validation, build duration and official-selection state.</p><button class="button button-quiet hidden" id="select-official" type="button">Select latest eligible version</button></section>`;
-  app.querySelector("#refresh").addEventListener("click", loadProfile);
-  app.querySelector("[data-signout]").addEventListener("click", signOut);
-  bindSectionNav(participant);
+
+function returnToParticipantAccess() {
+  if (sessionToken) void signOut();
+  else landing("login");
+}
+
+const arenaNavigation = [["live", "Live Arena"], ["bracket", "Tournament"], ["leaderboard", "Leaderboard"]];
+
+function renderArena(active = "live") {
+  document.body.classList.add("public-interface");
+  route = `arena-${active}`;
+  const content = active === "live"
+    ? `<section class="arena-hero"><div class="arena-copy"><span class="live-pill"><i></i> LIVE ARENA</span><h1>Two minds. One board.</h1><p>Public live-match feed is unavailable from this API instance.</p><div class="arena-state"><strong>No public match data</strong><span>Identities, clocks, moves and results will appear from the live-match service.</span></div></div><div class="arena-board-placeholder"><div class="arena-empty-board" role="img" aria-label="Empty chessboard illustration; no live position loaded">${Array.from({ length: 64 }, (_, index) => `<span class="${(Math.floor(index / 8) + index % 8) % 2 ? "dark" : "light"}"></span>`).join("")}</div><strong>Live board unavailable</strong><small>No match position is being fabricated.</small></div></section><section class="arena-lower"><article class="arena-panel"><h2>Live Matches</h2><p>No public match list is exposed by the current backend.</p></article><article class="arena-panel"><h2>Match Information</h2><p>Move list and evaluation data are not available.</p></article></section>`
+    : `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>${active === "bracket" ? "Tournament Bracket" : "Leaderboard"}</h1><p>The current backend does not publish ${active === "bracket" ? "a tournament bracket" : "leaderboard standings"} to a spectator API. No entries or rankings are displayed.</p></section>`;
+  app.innerHTML = `<div class="spectator-app"><header class="spectator-header"><a class="spectator-brand" href="#arena" data-view="arena"><span>AI</span> KNOCKOUT<small>BY INVITATION ONLY</small></a><nav aria-label="Spectator navigation">${arenaNavigation.map(([key, label]) => `<button type="button" class="${active === key ? "active" : ""}" data-arena-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${label}</button>`).join("")}</nav><span class="spectator-unavailable">PUBLIC FEED UNAVAILABLE</span><button class="arena-return" type="button" data-view="participant">Participant access</button></header><main class="spectator-main">${content}</main></div>`;
+  app.querySelectorAll("[data-arena-page]").forEach((button) => button.addEventListener("click", () => renderArena(button.dataset.arenaPage)));
+  app.querySelectorAll('[data-view="arena"]').forEach((button) => button.addEventListener("click", (event) => { event.preventDefault(); renderArena("live"); }));
+  app.querySelector('[data-view="participant"]').addEventListener("click", returnToParticipantAccess);
+}
+
+function renderAdminUnavailable(active = "overview") {
+  document.body.classList.add("public-interface");
+  route = "admin-unavailable";
+  const sections = [["overview", "Overview"], ["participants", "Participants"], ["submissions", "Submissions"], ["validation", "Validation Queue"], ["matches", "Live Matches"], ["workers", "Worker Fleet"], ["bracket", "Tournament Bracket"], ["controls", "Event Controls"], ["health", "System Health"], ["security", "Security & Audit"], ["settings", "Settings"]];
+  const activeSection = sections.find(([key]) => key === active) || sections[0];
+  app.innerHTML = `<div class="admin-app"><header class="admin-header"><a class="brand" href="#admin" aria-label="AI Knockout Admin Control Center"><span class="brand-mark">AI</span><span class="brand-word">KNOCKOUT<small>TOURNAMENT CONTROL CENTER</small></span></a><div class="admin-status"><span>${badge("Admin API unavailable")}</span><button type="button" class="button button-secondary" data-view="participant">Participant access</button></div></header><div class="admin-layout"><aside class="admin-nav" aria-label="Admin navigation">${sections.map(([key, label]) => `<button type="button" class="admin-nav-item ${active === key ? "active" : ""}" data-admin-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${esc(label)}</button>`).join("")}</aside><main class="admin-main"><div class="page-heading"><div><span class="eyebrow">ADMINISTRATIVE INTERFACE / ${esc(activeSection[1].toUpperCase())}</span><h1>${esc(activeSection[1] === "Overview" ? "Tournament Control Center" : activeSection[1])}</h1></div><span class="status-badge danger">NON-OPERATIONAL</span></div><section class="admin-empty"><strong>Administrative API and authorization are not available.</strong><p>This service does not expose admin identity or ${esc(activeSection[1].toLowerCase())} data and controls. This view is non-operational and displays no live values.</p></section><section class="admin-empty-grid">${["Participants", "Submissions", "Validation", "Live matches", "Workers", "Security alerts"].map((label) => `<article><span>${esc(label)}</span><strong>—</strong><small>Data unavailable</small></article>`).join("")}</section></main></div></div>`;
+  app.querySelectorAll("[data-admin-page]").forEach((button) => button.addEventListener("click", () => renderAdminUnavailable(button.dataset.adminPage)));
+  app.querySelector('[data-view="participant"]').addEventListener("click", returnToParticipantAccess);
+}
+
+function renderBuild(participant) {
+  shell(participant, "build", "Build Your Model", `<section class="build-layout"><article class="card build-main"><span class="phase-pill"><i></i> SERVER EVENT CLOCK</span><h2>Build your AI in your own environment.</h2><p class="body-copy">The portal reports the event clock and accepts a completed canonical USTAR package. It does not provide a hosted code editor or build runner.</p><div class="build-clock-panel"><span>BUILD SESSION ELAPSED</span><strong id="build-elapsed" aria-live="off">Loading</strong><small id="build-started">Loading server event status</small></div><div class="build-steps"><div><span>01</span><strong>Develop</strong><small>Use your own trusted development environment.</small></div><div><span>02</span><strong>Package</strong><small>Prepare an uncompressed USTAR archive.</small></div><div><span>03</span><strong>Submit</strong><small>The server validates the uploaded bytes.</small></div></div><button class="button button-primary" type="button" data-page="submit">Continue to Submit <span>→</span></button></article><aside class="card build-aside"><div class="card-heading"><h2>Package status</h2>${badge("Server validation")}</div><p class="body-copy">Package acceptance and eligibility come from the validation service. No build or validation result is estimated here.</p><div id="build-latest" class="unavailable-block">Loading latest submission…</div></aside></section>`);
+  loadBuildStatus();
+}
+
+async function loadBuildStatus() {
+  try {
+    const status = await api.eventStatus(sessionToken);
+    if (route !== "build") return;
+    startElapsedClock("build-elapsed", status.build_elapsed_seconds);
+    app.querySelector("#build-started").textContent = `Started ${dateTime(status.build_started_at)} · server time`;
+    app.querySelector("#build-latest").innerHTML = status.latest_submission
+      ? `<strong>Version ${esc(status.latest_submission.version)}</strong><p>${badge(status.latest_submission.state)}</p><small>Received ${esc(dateTime(status.latest_submission.submitted_at))}</small>`
+      : "No submission version is recorded.";
+  } catch (error) { if (!handleSessionError(error)) app.querySelector("#build-latest").textContent = "Event clock unavailable."; }
+}
+
+function renderSubmit(participant) {
+  shell(participant, "submit", "Submit Your Model", `<section class="submit-layout"><article class="card upload-card"><div class="card-heading"><div><span class="eyebrow">UPLOAD → VALIDATION → ELIGIBILITY</span><h2>Submit your package</h2></div><span class="card-mark blue">↑</span></div><p class="body-copy">Upload the exact uncompressed USTAR archive produced by your build. The server records the artifact and reports validation; upload success alone does not mean the package is eligible.</p><form id="upload-form" class="upload-form"><label class="file-drop" for="archive-file"><span class="upload-symbol" aria-hidden="true">↑</span><strong>Choose a USTAR archive</strong><span>Uncompressed .tar · package limits enforced by server</span><input id="archive-file" type="file" accept=".tar,application/x-tar,application/octet-stream" required><span id="file-name" class="file-name">No file selected</span></label><p id="upload-error" class="form-message" role="alert"></p><button class="button button-primary" type="submit">Submit for validation <span>→</span></button></form><div id="upload-result" aria-live="polite"></div></article><article class="card workflow-card"><div class="card-heading"><h2>Submission workflow</h2></div><ol class="workflow"><li><span>1</span><div><strong>Uploaded</strong><small>Exact archive bytes are received.</small></div></li><li><span>2</span><div><strong>Validating</strong><small>Package checks and security validation run server-side.</small></div></li><li><span>3</span><div><strong>Eligible</strong><small>Only an eligible version can be selected or used for a development match.</small></div></li></ol><p class="callout-note">A rejected or pending result remains visible in submission history. Do not upload credentials or secrets in an archive.</p></article></section><section class="card history-card"><div class="card-heading"><h2>Submission History</h2><span class="muted-label">Server records</span></div><div id="submission-history">Loading submissions…</div></section>`);
+  app.querySelector("#archive-file").addEventListener("change", (event) => {
+    app.querySelector("#file-name").textContent = event.target.files[0]?.name || "No file selected";
+  });
+  app.querySelector("#upload-form").addEventListener("submit", uploadSubmission);
+  loadSubmissionHistory();
+}
+
+async function uploadSubmission(event) {
+  event.preventDefault();
+  const file = app.querySelector("#archive-file").files[0];
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  const errorNode = app.querySelector("#upload-error");
+  const resultNode = app.querySelector("#upload-result");
+  if (!file) return;
+  button.disabled = true;
+  button.textContent = "Uploading…";
+  errorNode.textContent = "";
+  resultNode.textContent = "";
+  try {
+    const created = await api.createSubmission(sessionToken);
+    const uploaded = await api.uploadVersion(sessionToken, created.submission_id, await file.arrayBuffer());
+    const validation = uploaded.validation || {};
+    resultNode.innerHTML = `<div class="upload-outcome"><strong>Server recorded version ${esc(uploaded.version.version)}</strong>${badge(uploaded.version.state)}<p>Validation outcome: ${esc(validation.outcome || "Not reported")} · ${esc(validation.validator_version || "validator version unavailable")}</p><small>Artifact SHA-256: <code>${esc(uploaded.version.artifact_sha256)}</code></small></div>`;
+    await loadSubmissionHistory();
+    notify("Submission received by the server");
+  } catch (error) {
+    if (handleSessionError(error)) return;
+    if (error.status === 422 && error.payload) {
+      const v = error.payload.validation || {};
+      resultNode.innerHTML = `<div class="upload-outcome rejected"><strong>Package rejected</strong>${badge(v.outcome || "Rejected")}<p>${esc(error.payload.error || "The server rejected this archive.")}</p><small>The rejected result is retained in server history.</small></div>`;
+      await loadSubmissionHistory();
+    } else errorNode.textContent = error.message || "Upload failed. The server did not confirm receipt.";
+  } finally {
+    if (button.isConnected) { button.disabled = false; button.innerHTML = 'Submit for validation <span>→</span>'; }
+  }
+}
+
+async function loadSubmissionHistory() {
+  const target = app.querySelector("#submission-history");
+  if (!target) return;
+  try {
+    const submissions = await api.submissions(sessionToken);
+    const versions = [];
+    for (const item of (submissions.items || []).slice(0, 12)) {
+      const response = await api.submissionVersions(sessionToken, item.submission_id);
+      versions.push(...(response.items || []));
+    }
+    if (!target.isConnected) return;
+    if (!versions.length) { target.innerHTML = `<div class="empty-table-state">No submissions recorded.</div>`; return; }
+    target.innerHTML = `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Version</th><th>Validation</th><th>Submitted</th><th>Artifact</th><th></th></tr></thead><tbody>${versions.slice(0, 30).map((version) => `<tr><td>v${esc(version.version)}</td><td>${badge(version.state)}</td><td>${esc(dateTime(version.submitted_at))}</td><td><code>${esc(version.artifact_sha256.slice(0, 12))}…</code></td><td><button class="table-action" type="button" data-validation="${esc(version.submission_id)}" data-version="${esc(version.version)}">Details</button></td></tr>`).join("")}</tbody></table></div>`;
+    target.querySelectorAll("[data-validation]").forEach((button) => button.addEventListener("click", () => renderSubmissionDetails(activeParticipant, button.dataset.validation, button.dataset.version)));
+  } catch (error) { if (!handleSessionError(error)) target.textContent = "Submission history could not be loaded."; }
+}
+
+async function renderSubmissionDetails(participant, submissionId, version) {
+  shell(participant, "submit", "Submission Details", `<section class="card submission-detail-card"><div class="card-heading"><div><span class="eyebrow">SERVER RECORDED ARTIFACT</span><h2>Submission version ${esc(version)}</h2></div><button class="button button-secondary" id="submission-back" type="button">← Submission history</button></div><div id="submission-detail-content" class="loading-copy">Loading exact version and validation evidence…</div></section>`);
+  app.querySelector("#submission-back").addEventListener("click", () => renderSubmit(participant));
+  try {
+    const [versions, validation] = await Promise.all([api.submissionVersions(sessionToken, submissionId), api.validation(sessionToken, submissionId, version)]);
+    const item = (versions.items || []).find((entry) => String(entry.version) === String(version));
+    const target = app.querySelector("#submission-detail-content");
+    if (!target || !item) return;
+    const attempts = validation.attempts || [];
+    const manifest = item.manifest || {};
+    target.innerHTML = `<div class="submission-detail-summary"><div><span class="eyebrow">VALIDATION STATUS</span>${badge(item.state)}</div><div><span class="eyebrow">SUBMITTED</span><strong>${esc(dateTime(item.submitted_at))}</strong></div><div><span class="eyebrow">ARTIFACT SHA-256</span><code>${esc(item.artifact_sha256)}</code></div></div><section class="validation-evidence"><h3>Validation evidence</h3>${attempts.length ? `<ol class="validation-attempts">${attempts.map((attempt) => `<li><div>${badge(attempt.outcome)}<strong>${esc(attempt.validator_version)}</strong></div><time>${esc(dateTime(attempt.completed_at || attempt.started_at))}</time>${attempt.report ? `<pre>${esc(JSON.stringify(attempt.report, null, 2))}</pre>` : `<p>Detailed report not exposed by the server.</p>`}</li>`).join("")}</ol>` : `<p class="muted-copy">No validation attempts are recorded for this version.</p>`}</section><section class="manifest-summary"><h3>Manifest</h3><dl class="profile-facts"><div><dt>Engine</dt><dd>${esc(manifest.engine_name || "Not present in response")}</dd></div><div><dt>Engine version</dt><dd>${esc(manifest.engine_version || "Not present in response")}</dd></div><div><dt>Protocol</dt><dd>${esc(manifest.protocol_version || "Not present in response")}</dd></div><div><dt>Runtime</dt><dd>${esc(manifest.runtime || "Not present in response")}</dd></div></dl></section>`;
+  } catch (error) { if (!handleSessionError(error)) app.querySelector("#submission-detail-content").textContent = "Submission details are unavailable."; }
+}
+
+async function requestDevelopmentMatch() {
   try {
     const status = await api.eventStatus(sessionToken);
     const latest = status.latest_submission;
-    const heading = app.querySelector("#submission-heading");
-    const copy = app.querySelector("#submission-copy");
-    const button = app.querySelector("#select-official");
-    if (!latest) {
-      heading.textContent = "No submission received";
-      copy.textContent = "The server has not recorded an artifact version for this participant.";
-      return;
-    }
-    heading.textContent = `Version ${latest.version} · ${latest.state}`;
-    const official = status.official_submission
-      ? `Official selection: version ${status.official_submission.version}.`
-      : "No official version selected.";
-    const freeze = status.official_frozen_at ? ` Selection froze at ${new Date(status.official_frozen_at).toLocaleString()}.` : " Selection is open.";
-    copy.textContent = `Server received ${new Date(latest.submitted_at).toLocaleString()}; build duration ${latest.build_duration_seconds ?? "unavailable"} seconds. Validation: ${latest.validation_outcome || "pending"}. ${official}${freeze}`;
-    button.classList.toggle("hidden", latest.state !== "ELIGIBLE" || Boolean(status.official_frozen_at));
-    button.addEventListener("click", async () => {
-      try {
-        await api.selectOfficialSubmission(sessionToken, {
-          submission_id: latest.submission_id,
-          version: latest.version,
-        });
-        await participantSubmissions(participant);
-        notify("Official submission selection updated");
-      } catch (error) {
-        notify(error.message || "Could not update official submission");
-      }
-    });
+    if (!latest || latest.state !== "ELIGIBLE") return notify("An eligible submission version is required.");
+    const idempotencyKey = crypto.randomUUID();
+    await api.requestDevelopmentMatch(sessionToken, { submission_id: latest.submission_id, version: latest.version }, idempotencyKey);
+    notify("Development match request recorded");
+    renderMatches(activeParticipant);
   } catch (error) {
-    app.querySelector("#submission-heading").textContent = "Submission state unavailable";
-    app.querySelector("#submission-copy").textContent = error.message || "Could not load server submission state.";
+    if (handleSessionError(error)) return;
+    notify(error.status === 409 ? "A development match is already active or this request conflicts with server state." : error.message || "Could not request a development match.");
   }
 }
-function unavailableSection(participant, section) {
-  const sections = {
-    identity: ["AI identity", "Identity details", "This account was issued by the participant service. The current profile contract provides your entry name, Participant ID, optional team name, contact email, status, and registration date."],
-    submission: ["AI submission", "Submission service unavailable", "The current server has no submission endpoint or upload specification. No file has been uploaded and no validation state can be reported."],
-    matches: ["My matches", "Schedule not published", "The current server has no match scheduling endpoint. Your match list will appear here when the tournament service publishes server-backed fixtures."],
-    viewer: ["Live match", "No live match data", "A server-authoritative game feed is not available. The server currently exposes no FEN, move, clock, or match-state contract, so a chessboard cannot be rendered truthfully yet."],
-    leaderboard: ["Leaderboard", "Standings unavailable", "The current server has no public leaderboard or scoring contract. No ranks or scores are being estimated."],
-    history: ["Match history", "No match history service", "The current server has no match result or history endpoint. Completed games will appear here when those records are available from the server."]
-  };
-  const [title, heading, copy] = sections[section];
-  route = section;
-  app.innerHTML = `<section class="dashboard-head"><div><div class="section-index">AI KNOCKOUT <span>${esc(title.toUpperCase())}</span></div><h1>${esc(title)}</h1><div class="identity-line"><span>${esc(participant.name)}</span><code>${esc(participant.participant_id)}</code><span class="status-tag status-active">${esc(participant.status)}</span></div></div><div class="account-controls"><button class="button button-quiet" id="refresh" type="button">Refresh profile</button><button class="button button-quiet" data-signout type="button">Sign out</button></div></section>${sectionNav(section)}<section class="empty-state"><div class="empty-code">SERVICE STATUS / UNAVAILABLE</div><h2>${esc(heading)}</h2><p>${esc(copy)}</p></section>`;
-  app.querySelector("#refresh").addEventListener("click", loadProfile);
-  app.querySelector("[data-signout]").addEventListener("click", signOut);
-  bindSectionNav(participant);
+
+function renderMatches(participant) {
+  shell(participant, "matches", "Development Matches", `<section class="match-banner"><div><span class="phase-pill"><i></i> DEVELOPMENT · NOT OFFICIAL</span><h2>Test your AI against the event House AI.</h2><p>Exact submission versions, House AI identity, policy and match state come from the server.</p></div><button class="button button-primary" id="matches-request" type="button" disabled>Request match <span>→</span></button></section><section class="card matches-card"><div class="card-heading"><h2>Your Matches</h2><button class="link-button" id="matches-refresh" type="button">Refresh ↻</button></div><div id="matches-list">Loading match records…</div></section>`);
+  app.querySelector("#matches-request").addEventListener("click", requestDevelopmentMatch);
+  app.querySelector("#matches-refresh").addEventListener("click", () => renderMatches(participant));
+  loadMatches(participant);
+}
+
+async function loadMatches(participant) {
+  const target = app.querySelector("#matches-list");
+  try {
+    const [result, status] = await Promise.all([api.developmentMatches(sessionToken), api.eventStatus(sessionToken)]);
+    if (!target?.isConnected) return;
+    const latest = status.latest_submission;
+    const active = (result.items || []).some((match) => ["QUEUED", "STARTING", "RUNNING"].includes(match.state));
+    const button = app.querySelector("#matches-request");
+    button.disabled = !latest || latest.state !== "ELIGIBLE" || active;
+    button.title = !latest || latest.state !== "ELIGIBLE" ? "An eligible submission version is required." : active ? "An active match already exists." : "";
+    const matches = result.items || [];
+    if (!matches.length) { target.innerHTML = `<div class="empty-table-state"><strong>No development matches yet</strong><p>When an eligible submission is available, request a development match here.</p></div>`; return; }
+    target.innerHTML = `<div class="development-match-list">${matches.map((match) => `<article class="development-match-row"><div class="match-icon">${navIcon("matches")}</div><div class="match-subject"><strong>${esc(match.participant?.submission_id ? `Submission ${match.participant.submission_version}` : "Participant AI")}</strong><small>vs ${esc(match.house_ai?.house_ai_id || "House AI")} · v${esc(match.house_ai?.version ?? "—")}</small></div><div class="match-time"><span>${esc(dateTime(match.completed_at || match.created_at))}</span><small>Development only</small></div>${badge(match.state)}<button class="button button-secondary" data-match="${esc(match.match_id)}" type="button">${match.state === "COMPLETED" ? "View result" : "View status"}</button></article>`).join("")}</div>`;
+    target.querySelectorAll("[data-match]").forEach((button) => button.addEventListener("click", () => renderMatchDetail(participant, button.dataset.match)));
+  } catch (error) { if (!handleSessionError(error)) target.textContent = "Match service unavailable. No match state is being inferred."; }
+}
+
+async function renderMatchDetail(participant, matchId) {
+  shell(participant, "matches", "Development Match", `<section class="card match-detail-card"><div class="card-heading"><div><span class="phase-pill"><i></i> DEVELOPMENT · NOT OFFICIAL</span><h2>Match details</h2></div><button class="button button-secondary" id="match-refresh" type="button">Refresh status</button></div><div id="match-detail-content" class="loading-copy">Loading authoritative match state…</div></section>`);
+  app.querySelector("#match-refresh").addEventListener("click", () => renderMatchDetail(participant, matchId));
+  try {
+    const match = await api.developmentMatch(sessionToken, matchId);
+    if (!app.querySelector("#match-detail-content")) return;
+    const state = match.state;
+    app.querySelector("#match-detail-content").innerHTML = `<div class="match-detail-grid"><div class="match-overview"><div class="match-state-line">${badge(state)}<span>${esc(dateTime(match.started_at || match.created_at))}</span></div><div class="player-pair"><div class="player-card"><span class="player-color white">W</span><span><strong>${esc(match.participant?.submission_id ? `Participant · v${match.participant.submission_version}` : "Participant AI")}</strong><small>${esc(match.participant?.artifact_sha256 || "Artifact identity unavailable")}</small></span></div><div class="player-card"><span class="player-color black">B</span><span><strong>${esc(match.house_ai?.house_ai_id || "House AI")} · v${esc(match.house_ai?.version ?? "—")}</strong><small>${esc(match.house_ai?.artifact_sha256 || "Artifact identity unavailable")}</small></span></div></div><dl class="match-facts"><div><dt>Clock</dt><dd>${esc(match.initial_clock_ms / 60000)}+${esc(match.increment_ms / 1000)}</dd></div><div><dt>Move deadline</dt><dd>${esc(match.move_timeout_ms)} ms</dd></div><div><dt>Protocol</dt><dd>${esc(match.protocol_version)}</dd></div><div><dt>Rules</dt><dd>${esc(match.rules_version)}</dd></div></dl><div class="result-panel"><span class="eyebrow">SERVER RESULT</span><strong>${esc(match.result?.outcome || state.replaceAll("_", " "))}</strong><p>${esc(match.result?.reason || "No result recorded yet")}${match.result?.failure ? ` · ${esc(match.result.failure)}` : ""}</p></div></div><div class="board-panel"><div class="card-heading"><h3>Current Position</h3><small>${match.current_ply} plies</small></div>${renderChessboard(match.current_fen)}<div class="clock-row"><span>White <strong>${formatClock(match.white_remaining_ms)}</strong></span><span>Black <strong>${formatClock(match.black_remaining_ms)}</strong></span></div><p class="muted-copy">Evaluation and move transcript are not included in this API response.</p></div></div>`;
+  } catch (error) { if (!handleSessionError(error)) app.querySelector("#match-detail-content").textContent = error.status === 404 ? "Match not found." : "Match state unavailable."; }
+}
+
+function formatClock(milliseconds = 0) {
+  if (!Number.isFinite(milliseconds)) return "—";
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function renderChessboard(fen) {
+  if (typeof fen !== "string" || !fen) return `<div class="board-unavailable">Position unavailable</div>`;
+  const rows = fen.split(" ")[0].split("/");
+  if (rows.length !== 8) return `<div class="board-unavailable">Server position could not be displayed.</div>`;
+  const glyph = { p: "♟", r: "♜", n: "♞", b: "♝", q: "♛", k: "♚", P: "♙", R: "♖", N: "♘", B: "♗", Q: "♕", K: "♔" };
+  let squares = "";
+  rows.forEach((row, rank) => {
+    let file = 0;
+    for (const character of row) {
+      const count = /[1-8]/.test(character) ? Number(character) : 1;
+      for (let i = 0; i < count; i += 1) {
+        const piece = glyph[character] ? character : "";
+        const color = (rank + file) % 2 ? "dark" : "light";
+        squares += `<span class="square ${color}" aria-label="${String.fromCharCode(97 + file)}${8 - rank}${piece ? ` ${piece}` : " empty"}">${piece ? glyph[piece] : ""}</span>`;
+        file += 1;
+      }
+    }
+    if (file !== 8) squares = "";
+  });
+  return squares ? `<div class="chessboard" role="img" aria-label="Server-reported chess position">${squares}</div>` : `<div class="board-unavailable">Server position could not be displayed.</div>`;
+}
+
+function renderResults(participant) {
+  shell(participant, "results", "Results", `<div class="page-tabs" aria-label="Competition views"><button class="button button-secondary" type="button" data-page="bracket">Tournament Bracket</button><button class="button button-secondary" type="button" data-page="leaderboard">Leaderboard</button></div><section class="card results-card"><div class="card-heading"><div><span class="eyebrow">DEVELOPMENT ONLY</span><h2>Completed Match Results</h2></div><button class="link-button" type="button" data-page="matches">All matches →</button></div><div id="results-list">Loading server result records…</div></section><div class="callout-note">Development results do not represent official tournament standings.</div>`);
+  loadResults(participant);
+}
+
+function renderCompetitionUnavailable(participant, kind) {
+  const isBracket = kind === "bracket";
+  const title = isBracket ? "Tournament Bracket" : "Leaderboard";
+  const subject = isBracket ? "official bracket" : "official standings";
+  shell(participant, kind, title, `<section class="card unavailable-competition-card"><div class="empty-state-mark" aria-hidden="true">${isBracket ? "⌘" : "≡"}</div><span class="eyebrow">OFFICIAL COMPETITION DATA</span><h2>${title}</h2><p>The current participant API does not expose ${subject}. This view will show server-published data when that capability is available.</p><p class="unavailable-label">No bracket or ranking data is being inferred.</p><button class="button button-secondary" type="button" data-page="results">← Development results</button></section>`);
+}
+
+async function loadResults(participant) {
+  try {
+    const response = await api.developmentMatches(sessionToken);
+    const completed = (response.items || []).filter((match) => match.state === "COMPLETED" || match.state === "ABORTED");
+    const target = app.querySelector("#results-list");
+    if (!target) return;
+    if (!completed.length) { target.innerHTML = `<div class="empty-table-state">No completed development results are recorded.</div>`; return; }
+    target.innerHTML = `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Match</th><th>House AI</th><th>State</th><th>Result</th><th>Completed</th><th></th></tr></thead><tbody>${completed.map((match) => `<tr><td><code>${esc(match.match_id.slice(0, 8))}</code></td><td>${esc(match.house_ai?.house_ai_id || "—")} · v${esc(match.house_ai?.version ?? "—")}</td><td>${badge(match.state)}</td><td>${esc(match.result?.outcome || "No result")}${match.result?.reason ? ` · ${esc(match.result.reason)}` : ""}</td><td>${esc(dateTime(match.completed_at))}</td><td><button class="table-action" data-match="${esc(match.match_id)}" type="button">Details</button></td></tr>`).join("")}</tbody></table></div>`;
+    target.querySelectorAll("[data-match]").forEach((button) => button.addEventListener("click", () => renderMatchDetail(participant, button.dataset.match)));
+  } catch (error) { if (!handleSessionError(error)) app.querySelector("#results-list").textContent = "Result service unavailable."; }
+}
+
+function renderProfile(participant) {
+  shell(participant, "profile", "Participant Profile", `<section class="card profile-card"><div class="card-heading"><div><span class="eyebrow">SERVER-ISSUED IDENTITY</span><h2>Your account</h2></div>${badge(participant.status)}</div><dl class="profile-facts"><div><dt>AI / entry name</dt><dd>${esc(participant.name)}</dd></div><div><dt>Participant ID</dt><dd><code>${esc(participant.participant_id)}</code></dd></div><div><dt>Team</dt><dd>${participant.team_name ? esc(participant.team_name) : "Not provided"}</dd></div><div><dt>Contact email</dt><dd>${participant.email ? esc(participant.email) : "Not provided"}</dd></div><div><dt>Registered</dt><dd>${esc(dateTime(participant.created_at))}</dd></div><div><dt>Account status</dt><dd>${badge(participant.status)}</dd></div></dl><p class="callout-note">Access keys are never displayed again after registration. Sign out clears this browser session.</p></section>`);
+}
+
+function handleSessionError(error) {
+  if (error.status === 401 || error.status === 403) {
+    sessionToken = null;
+    landing("login", "Your session expired or was revoked. Sign in again.");
+    return true;
+  }
+  return false;
 }
 
 async function loadProfile() {
   if (!sessionToken) return landing("login");
-  const refresh = document.querySelector("#refresh");
-  if (refresh) { refresh.disabled = true; refresh.textContent = "Refreshing…"; }
   try {
     const profile = await api.me(sessionToken);
-    dashboard(profile);
-    try {
-      const eventStatus = await api.eventStatus(sessionToken);
-      renderEventStatus(eventStatus);
-    } catch (eventError) {
-      if (eventError.status === 401 || eventError.status === 403) throw eventError;
-      const elapsed = document.querySelector("#build-elapsed");
-      if (elapsed) elapsed.textContent = "Unavailable";
-      const started = document.querySelector("#build-started");
-      if (started) started.textContent = "Server event status could not be loaded.";
-      notify("Event status is temporarily unavailable.");
-    }
+    activeParticipant = profile;
+    navigate(route === "login" || route === "dashboard" ? "overview" : route, profile);
   } catch (error) {
-    if (error.status === 401 || error.status === 403) {
-      sessionToken = null;
-      landing("login", "Your session expired or was revoked. Sign in again.");
-    } else {
-      notify(error.message || "Could not refresh the profile");
-    }
+    if (!handleSessionError(error)) notify(error.message || "Could not refresh the profile");
   }
 }
 
 async function signOut() {
   const token = sessionToken;
   sessionToken = null;
+  activeParticipant = null;
+  clearInterval(buildClockTimer);
   landing("login");
-  try { if (token) await api.logout(token); }
-  catch { /* Local sign-out still clears the in-memory credential. */ }
-  notify("Signed out");
+  let revoked = !token;
+  try { if (token) { await api.logout(token); revoked = true; } }
+  catch { /* The local credential is cleared even when server revocation cannot be confirmed. */ }
+  notify(revoked
+    ? "Signed out. Server session revoked."
+    : "Signed out on this device; server session revocation could not be confirmed.");
 }
 
 landing("login");
