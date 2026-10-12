@@ -1,7 +1,6 @@
 """Unit tests for tournament bracket generation, scoring, and tie-breaking engine."""
 
 import uuid
-import pytest
 
 from app.tournaments.engine import (
     compute_leaderboard_standings,

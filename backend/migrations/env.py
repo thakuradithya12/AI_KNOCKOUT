@@ -17,13 +17,14 @@ from sqlalchemy import engine_from_config, pool
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.db.base import Base  # noqa: E402
+from app.db.url import normalize_sync_database_url  # noqa: E402
 from app.models import *  # noqa: E402, F401, F403
 
 # Alembic Config object
-config = context.config
+config = getattr(context, "config", None)
 
 # Setup logging from alembic.ini
-if config.config_file_name is not None:
+if config is not None and config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Target metadata for autogenerate
@@ -34,13 +35,15 @@ def get_database_url() -> str:
     """Get sync database URL from environment."""
     url = os.environ.get("DATABASE_URL_SYNC")
     if not url:
+        url = os.environ.get("DATABASE_URL")
+    if not url:
         user = os.environ.get("POSTGRES_USER", "aik_user")
         password = os.environ.get("POSTGRES_PASSWORD", "")
         host = os.environ.get("POSTGRES_HOST", "localhost")
         port = os.environ.get("POSTGRES_PORT", "5433")
         db = os.environ.get("POSTGRES_DB", "aik_db")
         url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
-    return url
+    return normalize_sync_database_url(url)
 
 
 def run_migrations_offline() -> None:
@@ -75,7 +78,8 @@ def run_migrations_online() -> None:
             context.run_migrations()
 
 
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()
+if config is not None and hasattr(context, "is_offline_mode"):
+    if context.is_offline_mode():
+        run_migrations_offline()
+    else:
+        run_migrations_online()

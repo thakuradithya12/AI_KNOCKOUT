@@ -19,6 +19,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.db.url import get_asyncpg_connect_args, normalize_async_database_url
+
 logger = logging.getLogger("ai-knockout.db")
 
 # Module-level engine and session factory — initialized at startup
@@ -40,8 +42,12 @@ def init_engine(
     """
     global _engine, _session_factory
 
+    normalized_url = normalize_async_database_url(database_url)
+    connect_args = get_asyncpg_connect_args(database_url)
+
     _engine = create_async_engine(
-        database_url,
+        normalized_url,
+        connect_args=connect_args,
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,

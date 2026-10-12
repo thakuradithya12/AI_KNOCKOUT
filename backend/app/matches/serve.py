@@ -119,12 +119,16 @@ def build_hypercorn_config(tls: MatchCoordinatorServiceTLSConfig):
 async def run() -> None:
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+    from app.db.url import get_asyncpg_connect_args, normalize_async_database_url
+
     tls = MatchCoordinatorServiceTLSConfig.from_env()
     tls.build_server_ssl_context()
     database_url = os.environ.get("MATCH_DATABASE_URL")
     if not database_url:
         raise RuntimeError("MATCH_DATABASE_URL must be configured")
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+    normalized_db_url = normalize_async_database_url(database_url)
+    connect_args = get_asyncpg_connect_args(database_url)
+    engine = create_async_engine(normalized_db_url, connect_args=connect_args, pool_pre_ping=True)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     try:
         app = create_control_plane_app(

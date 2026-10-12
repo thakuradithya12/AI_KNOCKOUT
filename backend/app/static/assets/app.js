@@ -9,6 +9,7 @@ const toast = document.querySelector("#toast");
 // The existing backend issues opaque bearer tokens. Keep the token in memory
 // only; a page reload intentionally requires the participant to sign in again.
 let sessionToken = null;
+let organizerSecret = null;
 let route = "login";
 let toastTimer;
 let buildClockTimer;
@@ -454,7 +455,7 @@ function navigate(section, participant = activeParticipant) {
 }
 
 function renderPublicView(view) {
-  if (view === "admin") return renderAdminUnavailable();
+  if (view === "admin") return renderAdmin("overview");
   renderArena("live");
 }
 
@@ -484,9 +485,12 @@ async function loadArenaLive() {
   try {
     const matches = await api.tournamentMatches();
     if (!target.isConnected) return;
-    const activeMatch = (matches.items || []).find((m) => m.state === "RUNNING" || m.state === "STARTING") || (matches.items || [])[0];
-    const liveItems = (matches.items || []).slice(0, 10);
-    target.innerHTML = `<section class="arena-hero"><div class="arena-copy"><span class="live-pill"><i></i> LIVE ARENA</span><h1>Two minds. One board.</h1><p>${activeMatch ? `Official Match #${esc(activeMatch.match_id.slice(0, 8))}` : "Tournament Official Arena"}</p><div class="arena-state"><strong>${activeMatch ? `${esc(activeMatch.white_participant?.name || "White")} vs ${esc(activeMatch.black_participant?.name || "Black")}` : "No match currently running"}</strong><span>${activeMatch ? `State: ${esc(activeMatch.state)} · ${activeMatch.current_ply} plies` : "Official match pairings will appear here during competition."}</span></div></div><div class="arena-board-placeholder">${activeMatch?.current_fen ? renderChessboard(activeMatch.current_fen) : `<div class="arena-empty-board" role="img" aria-label="Empty chessboard">${Array.from({ length: 64 }, (_, index) => `<span class="${(Math.floor(index / 8) + index % 8) % 2 ? "dark" : "light"}"></span>`).join("")}</div>`}<strong>${activeMatch ? `Status: ${esc(activeMatch.state)}` : "Live board waiting"}</strong><small>${activeMatch ? `Clock: ${formatClock(activeMatch.white_remaining_ms)} (W) / ${formatClock(activeMatch.black_remaining_ms)} (B)` : "Awaiting match broadcast."}</small></div></section><section class="arena-lower"><article class="arena-panel"><h2>Official Matches</h2>${liveItems.length ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Match</th><th>White</th><th>Black</th><th>Status</th><th>Result</th></tr></thead><tbody>${liveItems.map((m) => `<tr><td><code>${esc(m.match_id.slice(0, 8))}</code></td><td>${esc(m.white_participant?.name || "TBD")}</td><td>${esc(m.black_participant?.name || "TBD")}</td><td>${badge(m.state)}</td><td>${esc(m.result_outcome || "In progress")}</td></tr>`).join("")}</tbody></table></div>` : "<p>No official tournament matches recorded yet.</p>"}</article><article class="arena-panel"><h2>Event Information</h2><p>Official tournament matches are verified by python-chess and executed in isolated worker sandboxes with strict resource and time quotas.</p></article></section>`;
+    const items = Array.isArray(matches) ? matches : (Array.isArray(matches?.items) ? matches.items : []);
+    const activeMatch = items.find((m) => m.state === "RUNNING" || m.state === "STARTING") || items[0];
+    const liveItems = items.slice(0, 10);
+    const whiteName = activeMatch ? (activeMatch.white_name || activeMatch.white_participant?.name || "White") : "White";
+    const blackName = activeMatch ? (activeMatch.black_name || activeMatch.black_participant?.name || "Black") : "Black";
+    target.innerHTML = `<section class="arena-hero"><div class="arena-copy"><span class="live-pill"><i></i> LIVE ARENA</span><h1>Two minds. One board.</h1><p>${activeMatch ? `Official Match #${esc(String(activeMatch.match_id).slice(0, 8))}` : "Tournament Official Arena"}</p><div class="arena-state"><strong>${activeMatch ? `${esc(whiteName)} vs ${esc(blackName)}` : "No match currently running"}</strong><span>${activeMatch ? `State: ${esc(activeMatch.state)} · ${activeMatch.current_ply ?? 0} plies` : "Official match pairings will appear here during competition."}</span></div></div><div class="arena-board-placeholder">${activeMatch?.current_fen ? renderChessboard(activeMatch.current_fen) : `<div class="arena-empty-board" role="img" aria-label="Empty chessboard">${Array.from({ length: 64 }, (_, index) => `<span class="${(Math.floor(index / 8) + index % 8) % 2 ? "dark" : "light"}"></span>`).join("")}</div>`}<strong>${activeMatch ? `Status: ${esc(activeMatch.state)}` : "Live board waiting"}</strong><small>${activeMatch ? `Clock: ${formatClock(activeMatch.white_remaining_ms)} (W) / ${formatClock(activeMatch.black_remaining_ms)} (B)` : "Awaiting match broadcast."}</small></div></section><section class="arena-lower"><article class="arena-panel"><h2>Official Matches</h2>${liveItems.length ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Match</th><th>White</th><th>Black</th><th>Status</th><th>Result</th></tr></thead><tbody>${liveItems.map((m) => `<tr><td><code>${esc(String(m.match_id).slice(0, 8))}</code></td><td>${esc(m.white_name || m.white_participant?.name || "TBD")}</td><td>${esc(m.black_name || m.black_participant?.name || "TBD")}</td><td>${badge(m.state)}</td><td>${esc(m.result_outcome || "In progress")}</td></tr>`).join("")}</tbody></table></div>` : "<p>No official tournament matches recorded yet.</p>"}</article><article class="arena-panel"><h2>Event Information</h2><p>Official tournament matches are verified by python-chess and executed in isolated worker sandboxes with strict resource and time quotas.</p></article></section>`;
   } catch (err) {
     if (target.isConnected) target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>Live Arena</h1><p>Spectator feed is currently unavailable.</p></section>`;
   }
@@ -524,14 +528,418 @@ async function loadArenaLeaderboard() {
   }
 }
 
-function renderAdminUnavailable(active = "overview") {
+function renderAdmin(active = "overview") {
   document.body.classList.add("public-interface");
-  route = "admin-unavailable";
-  const sections = [["overview", "Overview"], ["participants", "Participants"], ["submissions", "Submissions"], ["validation", "Validation Queue"], ["matches", "Live Matches"], ["workers", "Worker Fleet"], ["bracket", "Tournament Bracket"], ["controls", "Event Controls"], ["health", "System Health"], ["security", "Security & Audit"], ["settings", "Settings"]];
+  route = `admin-${active}`;
+
+  if (!organizerSecret) {
+    app.innerHTML = `
+      <div class="admin-app">
+        <header class="admin-header">
+          <a class="brand" href="#admin" aria-label="AI Knockout Admin Control Center">
+            <span class="brand-mark">AI</span>
+            <span class="brand-word">KNOCKOUT<small>TOURNAMENT CONTROL CENTER</small></span>
+          </a>
+          <div class="admin-status">
+            <span><span class="status-badge warning">ORGANIZER AUTHENTICATION REQUIRED</span></span>
+            <button type="button" class="button button-secondary" data-view="participant">Participant access</button>
+          </div>
+        </header>
+        <main style="max-width: 500px; margin: 60px auto; padding: 32px; background: #fff; border: 1px solid #dce2e9; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05);">
+          <span class="eyebrow" style="color: #65738a; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">SECURE CONTROL PLANE</span>
+          <h1 style="font-size: 22px; color: #17233b; margin: 8px 0 12px;">Organizer Sign-in</h1>
+          <p style="font-size: 13px; color: #5d6878; line-height: 1.5; margin-bottom: 24px;">Enter the organizer secret key to access event administration, participant oversight, submission eligibility, and tournament freeze controls.</p>
+          <form id="admin-auth-form">
+            <div class="field" style="margin-bottom: 20px;">
+              <label for="admin-secret-input" style="display: block; font-size: 12px; font-weight: 600; color: #35435e; margin-bottom: 6px;">Organizer Secret Key</label>
+              <input type="password" id="admin-secret-input" name="secret" class="input" style="width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid #c7d2e0; border-radius: 6px; font-size: 14px;" placeholder="••••••••••••••••" autocomplete="off" required autofocus />
+            </div>
+            <div id="admin-auth-error" style="display: none; padding: 10px 14px; margin-bottom: 18px; border: 1px solid #edc6c6; border-left: 3px solid #dc4d4d; background: #fff5f5; color: #842d2d; font-size: 12px; border-radius: 4px;"></div>
+            <div style="display: flex; gap: 12px; align-items: center;">
+              <button type="submit" id="admin-auth-submit" class="button button-primary" style="padding: 10px 20px;">Authenticate &amp; Unlock</button>
+              <button type="button" class="button button-secondary" data-view="participant">Cancel</button>
+            </div>
+          </form>
+        </main>
+      </div>
+    `;
+
+    const form = app.querySelector("#admin-auth-form");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const secretInput = app.querySelector("#admin-secret-input");
+      const secretVal = secretInput.value.trim();
+      const errBox = app.querySelector("#admin-auth-error");
+      const submitBtn = app.querySelector("#admin-auth-submit");
+      if (!secretVal) return;
+      errBox.style.display = "none";
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Verifying…";
+      try {
+        await api.adminOverview(secretVal);
+        organizerSecret = secretVal;
+        notify("Organizer authenticated successfully.");
+        renderAdmin("overview");
+      } catch (err) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Authenticate & Unlock";
+        errBox.textContent = err.message || "Organizer authentication failed. Invalid organizer secret.";
+        errBox.style.display = "block";
+        secretInput.value = "";
+        secretInput.focus();
+      }
+    });
+
+    app.querySelectorAll('[data-view="participant"]').forEach((btn) => btn.addEventListener("click", returnToParticipantAccess));
+    return;
+  }
+
+  const sections = [
+    ["overview", "Overview"],
+    ["participants", "Participants"],
+    ["submissions", "Submissions"],
+    ["controls", "Event Controls"],
+    ["audit", "Audit Log"],
+  ];
   const activeSection = sections.find(([key]) => key === active) || sections[0];
-  app.innerHTML = `<div class="admin-app"><header class="admin-header"><a class="brand" href="#admin" aria-label="AI Knockout Admin Control Center"><span class="brand-mark">AI</span><span class="brand-word">KNOCKOUT<small>TOURNAMENT CONTROL CENTER</small></span></a><div class="admin-status"><span>${badge("Admin API unavailable")}</span><button type="button" class="button button-secondary" data-view="participant">Participant access</button></div></header><div class="admin-layout"><aside class="admin-nav" aria-label="Admin navigation">${sections.map(([key, label]) => `<button type="button" class="admin-nav-item ${active === key ? "active" : ""}" data-admin-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${esc(label)}</button>`).join("")}</aside><main class="admin-main"><div class="page-heading"><div><span class="eyebrow">ADMINISTRATIVE INTERFACE / ${esc(activeSection[1].toUpperCase())}</span><h1>${esc(activeSection[1] === "Overview" ? "Tournament Control Center" : activeSection[1])}</h1></div><span class="status-badge danger">NON-OPERATIONAL</span></div><section class="admin-empty"><strong>Administrative API and authorization are not available.</strong><p>This service does not expose admin identity or ${esc(activeSection[1].toLowerCase())} data and controls. This view is non-operational and displays no live values.</p></section><section class="admin-empty-grid">${["Participants", "Submissions", "Validation", "Live matches", "Workers", "Security alerts"].map((label) => `<article><span>${esc(label)}</span><strong>—</strong><small>Data unavailable</small></article>`).join("")}</section></main></div></div>`;
-  app.querySelectorAll("[data-admin-page]").forEach((button) => button.addEventListener("click", () => renderAdminUnavailable(button.dataset.adminPage)));
-  app.querySelector('[data-view="participant"]').addEventListener("click", returnToParticipantAccess);
+
+  app.innerHTML = `
+    <div class="admin-app">
+      <header class="admin-header">
+        <a class="brand" href="#admin" aria-label="AI Knockout Admin Control Center">
+          <span class="brand-mark">AI</span>
+          <span class="brand-word">KNOCKOUT<small>TOURNAMENT CONTROL CENTER</small></span>
+        </a>
+        <div class="admin-status">
+          <span><span class="status-badge success">ORGANIZER ACCESS ACTIVE</span></span>
+          <button type="button" class="button button-secondary" id="admin-lock-btn">Lock Session</button>
+          <button type="button" class="button button-secondary" data-view="participant">Participant access</button>
+        </div>
+      </header>
+      <div class="admin-layout">
+        <aside class="admin-nav" aria-label="Admin navigation">
+          ${sections.map(([key, label]) => `
+            <button type="button" class="admin-nav-item ${active === key ? "active" : ""}" data-admin-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${esc(label)}</button>
+          `).join("")}
+        </aside>
+        <main class="admin-main">
+          <div class="page-heading">
+            <div>
+              <span class="eyebrow">ADMINISTRATIVE INTERFACE / ${esc(activeSection[1].toUpperCase())}</span>
+              <h1>${esc(activeSection[1] === "Overview" ? "Tournament Control Center" : activeSection[1])}</h1>
+            </div>
+            <span class="status-badge success">OPERATIONAL</span>
+          </div>
+          <div id="admin-content">
+            <div class="loading-copy" style="padding: 40px; text-align: center;">Loading ${esc(activeSection[1].toLowerCase())} data…</div>
+          </div>
+        </main>
+      </div>
+    </div>
+  `;
+
+  app.querySelector("#admin-lock-btn")?.addEventListener("click", () => {
+    organizerSecret = null;
+    notify("Organizer session locked.");
+    renderAdmin("overview");
+  });
+  app.querySelectorAll("[data-admin-page]").forEach((btn) => btn.addEventListener("click", () => renderAdmin(btn.dataset.adminPage)));
+  app.querySelectorAll('[data-view="participant"]').forEach((btn) => btn.addEventListener("click", returnToParticipantAccess));
+
+  if (active === "overview") loadAdminOverview();
+  else if (active === "participants") loadAdminParticipants();
+  else if (active === "submissions") loadAdminSubmissions();
+  else if (active === "controls") loadAdminControls();
+  else if (active === "audit") loadAdminAudit();
+}
+
+function handleAdminError(target, err) {
+  if (!target || !target.isConnected) return;
+  if (err.status === 401 || err.status === 403) {
+    organizerSecret = null;
+    notify("Organizer session expired or invalid. Please re-authenticate.");
+    renderAdmin("overview");
+    return;
+  }
+  target.innerHTML = `
+    <div style="padding: 20px; border: 1px solid #edc6c6; border-left: 3px solid #dc4d4d; background: #fff; border-radius: 4px;">
+      <strong style="color: #842d2d;">Error loading admin data</strong>
+      <p style="margin: 8px 0 0; color: #5d6878; font-size: 12px;">${esc(err.message || "An unexpected error occurred.")}</p>
+    </div>
+  `;
+}
+
+async function loadAdminOverview() {
+  const target = app.querySelector("#admin-content");
+  if (!target) return;
+  try {
+    const data = await api.adminOverview(organizerSecret);
+    if (!target.isConnected) return;
+    target.innerHTML = `
+      <div style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; background: #fff; border: 1px solid #dce2e9; border-radius: 6px;">
+        <div>
+          <strong style="font-size: 13px; color: #17233b;">Official Submissions Status: </strong>
+          <span style="font-size: 13px; color: #5d6878;">${data.official_frozen ? "FROZEN (Locked for competition)" : "OPEN (Participants may update official selections)"}</span>
+        </div>
+        <div>
+          ${data.official_frozen ? '<span class="status-badge danger">OFFICIAL FROZEN</span>' : '<span class="status-badge success">OFFICIAL OPEN</span>'}
+        </div>
+      </div>
+      <section class="admin-empty-grid">
+        <article><span>Registered Participants</span><strong>${data.participants_count}</strong><small>Total registered accounts</small></article>
+        <article><span>Submissions Total</span><strong>${data.submissions_count}</strong><small>Participant submissions</small></article>
+        <article><span>Submission Versions</span><strong>${data.submission_versions_count}</strong><small>Total versions uploaded</small></article>
+        <article><span>Eligible Versions</span><strong>${data.eligible_versions_count}</strong><small>Approved for tournament</small></article>
+        <article><span>Official Selections</span><strong>${data.official_selections_count}</strong><small>Participants with active selection</small></article>
+        <article><span>Official Freeze</span><strong>${data.official_frozen ? "LOCKED" : "OPEN"}</strong><small>${data.official_freeze_at ? esc(dateTime(data.official_freeze_at)) : "Awaiting organizer freeze"}</small></article>
+        <article><span>Matches Total</span><strong>${data.matches_total}</strong><small>Total matches recorded</small></article>
+        <article><span>Active Matches</span><strong>${data.matches_active}</strong><small>Running / starting / queued</small></article>
+        <article><span>Completed Matches</span><strong>${data.matches_completed}</strong><small>Concluded tournament matches</small></article>
+      </section>
+    `;
+  } catch (err) {
+    handleAdminError(target, err);
+  }
+}
+
+async function loadAdminParticipants() {
+  const target = app.querySelector("#admin-content");
+  if (!target) return;
+  try {
+    const list = await api.adminParticipants(organizerSecret);
+    if (!target.isConnected) return;
+    if (!list || !list.length) {
+      target.innerHTML = `<div style="padding: 24px; background: #fff; border: 1px solid #dce2e9; border-radius: 6px;"><p>No participants registered yet.</p></div>`;
+      return;
+    }
+    target.innerHTML = `
+      <div class="data-table-wrap" style="background: #fff; border: 1px solid #dce2e9; border-radius: 6px; padding: 12px;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Participant ID</th>
+              <th>Name</th>
+              <th>Email</th>
+              <th>Status</th>
+              <th>Submissions</th>
+              <th>Official Selection</th>
+              <th>Registered</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map((p) => `
+              <tr>
+                <td><code>${esc(p.participant_id)}</code></td>
+                <td><strong>${esc(p.name)}</strong>${p.team_name ? ` <small>(${esc(p.team_name)})</small>` : ""}</td>
+                <td>${esc(p.email)}</td>
+                <td>${badge(p.status)}</td>
+                <td>${p.submissions_count}</td>
+                <td>${p.has_official_selection ? '<span class="status-badge success">SELECTED</span>' : '<span class="status-badge neutral">NONE</span>'}</td>
+                <td>${esc(dateTime(p.created_at))}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (err) {
+    handleAdminError(target, err);
+  }
+}
+
+async function loadAdminSubmissions() {
+  const target = app.querySelector("#admin-content");
+  if (!target) return;
+  try {
+    const list = await api.adminSubmissions(organizerSecret);
+    if (!target.isConnected) return;
+    if (!list || !list.length) {
+      target.innerHTML = `<div style="padding: 24px; background: #fff; border: 1px solid #dce2e9; border-radius: 6px;"><p>No submissions uploaded yet.</p></div>`;
+      return;
+    }
+    target.innerHTML = `
+      <div class="data-table-wrap" style="background: #fff; border: 1px solid #dce2e9; border-radius: 6px; padding: 12px;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Participant</th>
+              <th>Version ID</th>
+              <th>Ver</th>
+              <th>State</th>
+              <th>Validation</th>
+              <th>Digest (SHA-256)</th>
+              <th>Created</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map((s) => `
+              <tr>
+                <td><strong>${esc(s.participant_name)}</strong><br><small style="color:#718096;"><code>${esc(s.participant_id)}</code></small></td>
+                <td><code>${esc(s.version_id ? s.version_id.slice(0, 8) : "—")}</code></td>
+                <td>v${esc(s.version)}</td>
+                <td>${badge(s.state)}</td>
+                <td>${s.validation_outcome ? badge(s.validation_outcome) : '<span class="status-badge neutral">PENDING</span>'}</td>
+                <td title="${esc(s.artifact_sha256 || "")}"><code>${esc(s.artifact_sha256 ? s.artifact_sha256.slice(0, 12) + "…" : "—")}</code></td>
+                <td>${esc(dateTime(s.created_at))}</td>
+                <td>
+                  ${s.state !== "ELIGIBLE" ? `
+                    <button type="button" class="button button-secondary" style="padding: 4px 8px; font-size: 11px;" data-approve-version="${esc(s.version_id)}" data-participant="${esc(s.participant_name)}" data-version="${esc(s.version)}">Approve Eligibility</button>
+                  ` : '<span class="status-badge success">ELIGIBLE</span>'}
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+    target.querySelectorAll("[data-approve-version]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const versionId = btn.dataset.approveVersion;
+        const participantName = btn.dataset.participant;
+        const ver = btn.dataset.version;
+        if (!confirm(`Approve submission v${ver} for ${participantName} as tournament ELIGIBLE?`)) return;
+        btn.disabled = true;
+        btn.textContent = "Approving…";
+        try {
+          await api.adminApproveSubmission(organizerSecret, {
+            submission_version_id: versionId,
+            reviewer_id: "organizer-admin",
+            notes: "Approved via Organizer Control Center",
+          });
+          notify(`Version ${ver} for ${participantName} approved as ELIGIBLE.`);
+          loadAdminSubmissions();
+        } catch (err) {
+          notify(err.message || "Failed to approve submission.");
+          btn.disabled = false;
+          btn.textContent = "Approve Eligibility";
+        }
+      });
+    });
+  } catch (err) {
+    handleAdminError(target, err);
+  }
+}
+
+async function loadAdminControls() {
+  const target = app.querySelector("#admin-content");
+  if (!target) return;
+  try {
+    const overview = await api.adminOverview(organizerSecret);
+    if (!target.isConnected) return;
+    target.innerHTML = `
+      <div style="display: grid; gap: 24px;">
+        <article style="background: #fff; border: 1px solid #dce2e9; border-radius: 6px; padding: 24px;">
+          <h2 style="font-size: 16px; margin: 0 0 8px; color: #17233b;">Official Tournament Freeze Status</h2>
+          <p style="font-size: 13px; color: #5d6878; margin-bottom: 16px;">
+            The official tournament freeze permanently locks all participant submission selections and marks the end of the submission window.
+          </p>
+          <div style="margin-bottom: 20px;">
+            ${overview.official_frozen ? `
+              <div style="padding: 16px; border: 1px solid #c3e6cb; background: #d4edda; border-radius: 6px; color: #155724;">
+                <strong>Official submissions are FROZEN.</strong>
+                <p style="margin: 6px 0 0; font-size: 12px;">Frozen at: ${overview.official_freeze_at ? esc(dateTime(overview.official_freeze_at)) : "Recorded"}</p>
+                <p style="margin: 4px 0 0; font-size: 12px;">Participant models are locked for tournament pairings. No further submissions or official selections can be changed.</p>
+              </div>
+            ` : `
+              <div style="padding: 16px; border: 1px solid #ffeeba; background: #fff3cd; border-radius: 6px; color: #856404; margin-bottom: 20px;">
+                <strong>Official submissions are currently OPEN.</strong>
+                <p style="margin: 6px 0 0; font-size: 12px;">Participants can continue submitting packages and selecting their official version.</p>
+              </div>
+              <div style="border: 1px solid #edc6c6; border-left: 4px solid #dc4d4d; background: #fff5f5; padding: 20px; border-radius: 6px;">
+                <h3 style="color: #842d2d; font-size: 14px; margin: 0 0 8px;">IRREVERSIBLE ACTION: Execute Official Freeze</h3>
+                <p style="color: #5d6878; font-size: 12px; line-height: 1.5; margin-bottom: 16px;">
+                  Freezing the tournament cannot be undone. Once executed, participants will no longer be able to select or modify official submissions. Current selections count: <strong>${overview.official_selections_count}</strong>.
+                </p>
+                <div style="display: flex; flex-direction: column; gap: 12px; max-width: 400px;">
+                  <label for="freeze-confirm-input" style="font-size: 12px; font-weight: 600; color: #35435e;">
+                    Type <code>FREEZE</code> to enable the freeze control:
+                  </label>
+                  <input type="text" id="freeze-confirm-input" autocomplete="off" placeholder="FREEZE" style="padding: 8px 12px; border: 1px solid #c7d2e0; border-radius: 4px; font-size: 13px;" />
+                  <button type="button" id="btn-execute-freeze" class="button" style="background: #dc4d4d; color: #fff; padding: 10px 16px; font-weight: 700; cursor: not-allowed; opacity: 0.5;" disabled>Execute Official Tournament Freeze</button>
+                </div>
+              </div>
+            `}
+          </div>
+        </article>
+      </div>
+    `;
+
+    if (!overview.official_frozen) {
+      const input = target.querySelector("#freeze-confirm-input");
+      const btn = target.querySelector("#btn-execute-freeze");
+      input?.addEventListener("input", () => {
+        const ok = input.value.trim() === "FREEZE";
+        btn.disabled = !ok;
+        btn.style.opacity = ok ? "1" : "0.5";
+        btn.style.cursor = ok ? "pointer" : "not-allowed";
+      });
+
+      btn?.addEventListener("click", async () => {
+        if (input.value.trim() !== "FREEZE") return;
+        if (!confirm("CRITICAL WARNING: This action is permanent and cannot be undone. Freeze official submissions now?")) return;
+        btn.disabled = true;
+        btn.textContent = "Executing Freeze…";
+        try {
+          await api.adminFreeze(organizerSecret, {
+            reason_code: "OFFICIAL_BUILD_WINDOW_CLOSED",
+            actor_id: "organizer-lead",
+          });
+          notify("Tournament officially FROZEN.");
+          loadAdminControls();
+        } catch (err) {
+          notify(err.message || "Failed to execute freeze.");
+          btn.disabled = false;
+          btn.textContent = "Execute Official Tournament Freeze";
+        }
+      });
+    }
+  } catch (err) {
+    handleAdminError(target, err);
+  }
+}
+
+async function loadAdminAudit() {
+  const target = app.querySelector("#admin-content");
+  if (!target) return;
+  try {
+    const list = await api.adminAuditLog(organizerSecret);
+    if (!target.isConnected) return;
+    if (!list || !list.length) {
+      target.innerHTML = `<div style="padding: 24px; background: #fff; border: 1px solid #dce2e9; border-radius: 6px;"><p>No audit log events recorded yet.</p></div>`;
+      return;
+    }
+    target.innerHTML = `
+      <div class="data-table-wrap" style="background: #fff; border: 1px solid #dce2e9; border-radius: 6px; padding: 12px;">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Severity</th>
+              <th>Event Type</th>
+              <th>Actor</th>
+              <th>Aggregate</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map((e) => `
+              <tr>
+                <td>${esc(dateTime(e.recorded_at))}</td>
+                <td><span class="status-badge ${e.severity === "CRITICAL" ? "danger" : e.severity === "WARN" ? "warning" : "neutral"}">${esc(e.severity)}</span></td>
+                <td><strong>${esc(e.event_type)}</strong></td>
+                <td>${esc(e.actor_kind)}: <code>${esc(e.actor_id)}</code></td>
+                <td>${esc(e.aggregate_type)}: <code>${esc(String(e.aggregate_id).slice(0, 8))}</code></td>
+                <td><small><code>${esc(JSON.stringify(e.metadata || {}))}</code></small></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      </div>
+    `;
+  } catch (err) {
+    handleAdminError(target, err);
+  }
 }
 
 function renderBuild(participant) {

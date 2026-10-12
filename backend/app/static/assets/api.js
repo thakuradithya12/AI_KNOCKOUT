@@ -27,6 +27,7 @@ async function request(path, { method = "GET", body, rawBody, token, signal, hea
     if (method === "POST" && path === "/auth/login" && (status === 401 || status === 403)) message = "Participant ID or Access Key is incorrect.";
     if (method === "POST" && path === "/participants/register" && status === 422) message = "Check the name and email format, then try again.";
     if (method === "POST" && path.match(/^\/submissions\/[^/]+\/versions$/) && status === 422) message = "The uploaded package did not pass validation.";
+    if (path.startsWith("/admin") && (status === 401 || status === 403)) message = "Organizer authentication failed. Invalid organizer secret.";
     throw new ApiError(status, message, payload);
   }
   return response.status === 204 ? null : response.json();
@@ -56,4 +57,10 @@ export const api = {
   tournamentLeaderboard: (signal) => request("/tournaments/leaderboard", { signal }),
   tournamentMatches: (signal) => request("/tournaments/matches", { signal }),
   tournamentMatch: (matchId, signal) => request(`/tournaments/matches/${encodeURIComponent(matchId)}`, { signal }),
+  adminOverview: (secret, signal) => request("/admin/overview", { headers: { "X-Organizer-Secret": secret }, signal }),
+  adminParticipants: (secret, signal) => request("/admin/participants", { headers: { "X-Organizer-Secret": secret }, signal }),
+  adminSubmissions: (secret, signal) => request("/admin/submissions", { headers: { "X-Organizer-Secret": secret }, signal }),
+  adminApproveSubmission: (secret, body) => request("/admin/submissions/approve", { method: "POST", headers: { "X-Organizer-Secret": secret }, body }),
+  adminFreeze: (secret, body) => request("/admin/freeze", { method: "POST", headers: { "X-Organizer-Secret": secret }, body }),
+  adminAuditLog: (secret, signal) => request("/admin/audit-log", { headers: { "X-Organizer-Secret": secret }, signal }),
 };

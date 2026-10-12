@@ -86,3 +86,11 @@ scratch/
 .venv-verify/
 backend/.venv-pg-verify/
 .venv-pg-verify/
+
+# Agent tools and local state
+.claude/
+.codex/
+.insta/
+.agents/skills/
+.github/skills/
+skills-lock.json

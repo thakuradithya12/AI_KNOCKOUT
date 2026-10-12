@@ -1,0 +1,8 @@
+{
+  "contract_version": "1",
+  "protocol_version": "aik-jsonl/1",
+  "engine_name": "AIK Trusted Benchmark Engine",
+  "engine_version": "1.0.0",
+  "runtime": "python-3.12",
+  "entrypoint": "engine/main.py"
+}

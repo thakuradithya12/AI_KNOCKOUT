@@ -11,6 +11,8 @@ from functools import lru_cache
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.db.url import normalize_async_database_url, normalize_sync_database_url
+
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables.
@@ -94,10 +96,27 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
-        """Ensure database URL is set and looks valid."""
+        """Ensure database URL is set, valid, and normalized for async driver."""
         if not v or "CHANGE_ME" in v:
             raise ValueError("DATABASE_URL must be configured with valid credentials.")
-        return v
+        return normalize_async_database_url(v)
+
+    @field_validator("database_url_sync")
+    @classmethod
+    def validate_database_url_sync(cls, v: str) -> str:
+        """Ensure sync database URL is normalized if configured."""
+        if not v:
+            return ""
+        if "CHANGE_ME" in v:
+            raise ValueError("DATABASE_URL_SYNC must be configured with valid credentials.")
+        return normalize_sync_database_url(v)
+
+    @property
+    def sync_database_url(self) -> str:
+        """Return explicit sync URL if configured, otherwise derive from database_url."""
+        if self.database_url_sync:
+            return self.database_url_sync
+        return normalize_sync_database_url(self.database_url)
 
     @field_validator("log_level")
     @classmethod

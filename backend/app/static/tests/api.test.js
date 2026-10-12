@@ -150,3 +150,93 @@ test("tournament bracket and leaderboard use public tournament contracts", async
     assert.equal(seen[1][1].method, "GET");
   } finally { restore(); }
 });
+
+test("tournament matches handles bare array and object responses", async () => {
+  const bareMatches = [{ match_id: "m-1", state: "RUNNING", white_name: "Alice", black_name: "Bob" }];
+  const objectMatches = { items: [{ match_id: "m-2", state: "COMPLETED", white_name: "Carol", black_name: "Dave" }] };
+  const emptyMatches = [];
+
+  let callCount = 0;
+  const restore = mockFetch(async (url) => {
+    assert.equal(url, "/api/v1/tournaments/matches");
+    callCount++;
+    if (callCount === 1) return new Response(JSON.stringify(bareMatches), { status: 200 });
+    if (callCount === 2) return new Response(JSON.stringify(objectMatches), { status: 200 });
+    return new Response(JSON.stringify(emptyMatches), { status: 200 });
+  });
+
+  try {
+    const res1 = await api.tournamentMatches();
+    assert.deepEqual(res1, bareMatches);
+    const res2 = await api.tournamentMatches();
+    assert.deepEqual(res2, objectMatches);
+    const res3 = await api.tournamentMatches();
+    assert.deepEqual(res3, emptyMatches);
+  } finally { restore(); }
+});
+
+test("admin overview, participants, and audit log require organizer secret header", async () => {
+  const seen = [];
+  const restore = mockFetch(async (url, options) => {
+    seen.push([url, options]);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  try {
+    await api.adminOverview("test-organizer-secret");
+    await api.adminParticipants("test-organizer-secret");
+    await api.adminAuditLog("test-organizer-secret");
+    assert.equal(seen[0][0], "/api/v1/admin/overview");
+    assert.equal(seen[0][1].headers["X-Organizer-Secret"], "test-organizer-secret");
+    assert.equal(seen[1][0], "/api/v1/admin/participants");
+    assert.equal(seen[1][1].headers["X-Organizer-Secret"], "test-organizer-secret");
+    assert.equal(seen[2][0], "/api/v1/admin/audit-log");
+    assert.equal(seen[2][1].headers["X-Organizer-Secret"], "test-organizer-secret");
+  } finally { restore(); }
+});
+
+test("admin submissions approval and event freeze send correct mutations and headers", async () => {
+  const seen = [];
+  const restore = mockFetch(async (url, options) => {
+    seen.push([url, options]);
+    return new Response(JSON.stringify({ status: "OK" }), { status: 200 });
+  });
+  try {
+    await api.adminApproveSubmission("test-organizer-secret", {
+      submission_version_id: "00000000-0000-0000-0000-000000000001",
+      reviewer_id: "lead-organizer",
+      notes: "Reviewed and approved",
+    });
+    await api.adminFreeze("test-organizer-secret", {
+      reason_code: "OFFICIAL_BUILD_WINDOW_CLOSED",
+      actor_id: "lead-organizer",
+    });
+    assert.equal(seen[0][0], "/api/v1/admin/submissions/approve");
+    assert.equal(seen[0][1].method, "POST");
+    assert.equal(seen[0][1].headers["X-Organizer-Secret"], "test-organizer-secret");
+    assert.deepEqual(JSON.parse(seen[0][1].body), {
+      submission_version_id: "00000000-0000-0000-0000-000000000001",
+      reviewer_id: "lead-organizer",
+      notes: "Reviewed and approved",
+    });
+    assert.equal(seen[1][0], "/api/v1/admin/freeze");
+    assert.equal(seen[1][1].method, "POST");
+    assert.equal(seen[1][1].headers["X-Organizer-Secret"], "test-organizer-secret");
+    assert.deepEqual(JSON.parse(seen[1][1].body), {
+      reason_code: "OFFICIAL_BUILD_WINDOW_CLOSED",
+      actor_id: "lead-organizer",
+    });
+  } finally { restore(); }
+});
+
+test("admin calls reject with dedicated organizer authentication message on 401/403", async () => {
+  const restore = mockFetch(async () => new Response(JSON.stringify({ detail: "ORGANIZER_AUTHENTICATION_REQUIRED" }), { status: 401 }));
+  try {
+    await assert.rejects(api.adminOverview("invalid-secret"), (error) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 401);
+      assert.equal(error.message, "Organizer authentication failed. Invalid organizer secret.");
+      return true;
+    });
+  } finally { restore(); }
+});
+

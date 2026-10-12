@@ -613,7 +613,7 @@ async def dispatch_development_match_jobs(
             select(MatchSide)
             .where(MatchSide.match_id == match.id)
             .order_by(MatchSide.kind)
-            .with_for_update()
+            .with_for_update(of=MatchSide)
         )
     ).scalars().all()
     by_kind = {side.kind: side for side in sides}
