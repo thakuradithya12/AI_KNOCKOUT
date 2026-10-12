@@ -83,9 +83,10 @@ def test_pg_0009_fresh_chain_policy_selection_and_typed_capability():
         # The 0008 PostgreSQL matrix has completed at this point. Recreate a
         # fresh database so the migration chain and role grants are exercised.
         cursor.execute("DROP DATABASE IF EXISTS aik_verify WITH (FORCE)")
+        cursor.execute(f"DROP DATABASE IF EXISTS {database} WITH (FORCE)")
         cursor.execute("DROP ROLE IF EXISTS aik_worker_gateway")
         cursor.execute(f"CREATE DATABASE {database}")
-        _alembic(admin_url, database, "head")
+        _alembic(admin_url, database, "0009_development_match_v1")
         dsn = _db_url(admin_url, database)
 
         with psycopg2.connect(dsn) as conn:

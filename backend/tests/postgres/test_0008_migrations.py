@@ -69,6 +69,10 @@ def test_pg01_fresh_migrations_and_pg02_legacy_backfill():
 
     # PG-02 uses a fresh pre-0008 schema and representative legacy participant
     # rows. The 0008 migration then performs the actual backfill.
+    cur.execute("DROP DATABASE IF EXISTS aik_verify_backfill WITH (FORCE)")
+    cur.execute("DROP DATABASE IF EXISTS aik_verify_empty WITH (FORCE)")
+    cur.execute("DROP DATABASE IF EXISTS aik_verify WITH (FORCE)")
+    cur.execute("DROP ROLE IF EXISTS aik_worker_gateway")
     cur.execute("CREATE DATABASE aik_verify_backfill")
     _alembic(admin_url, "aik_verify_backfill", "0007_event_mechanics")
     backfill_url = _db_url(admin_url, "aik_verify_backfill")
