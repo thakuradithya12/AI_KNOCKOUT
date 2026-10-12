@@ -446,8 +446,8 @@ function navigate(section, participant = activeParticipant) {
     case "submit": renderSubmit(participant); break;
     case "matches": renderMatches(participant); break;
     case "results": renderResults(participant); break;
-    case "bracket": renderCompetitionUnavailable(participant, "bracket"); break;
-    case "leaderboard": renderCompetitionUnavailable(participant, "leaderboard"); break;
+    case "bracket": renderTournamentBracketView(participant); break;
+    case "leaderboard": renderTournamentLeaderboardView(participant); break;
     case "profile": renderProfile(participant); break;
     default: dashboard(participant);
   }
@@ -468,13 +468,60 @@ const arenaNavigation = [["live", "Live Arena"], ["bracket", "Tournament"], ["le
 function renderArena(active = "live") {
   document.body.classList.add("public-interface");
   route = `arena-${active}`;
-  const content = active === "live"
-    ? `<section class="arena-hero"><div class="arena-copy"><span class="live-pill"><i></i> LIVE ARENA</span><h1>Two minds. One board.</h1><p>Public live-match feed is unavailable from this API instance.</p><div class="arena-state"><strong>No public match data</strong><span>Identities, clocks, moves and results will appear from the live-match service.</span></div></div><div class="arena-board-placeholder"><div class="arena-empty-board" role="img" aria-label="Empty chessboard illustration; no live position loaded">${Array.from({ length: 64 }, (_, index) => `<span class="${(Math.floor(index / 8) + index % 8) % 2 ? "dark" : "light"}"></span>`).join("")}</div><strong>Live board unavailable</strong><small>No match position is being fabricated.</small></div></section><section class="arena-lower"><article class="arena-panel"><h2>Live Matches</h2><p>No public match list is exposed by the current backend.</p></article><article class="arena-panel"><h2>Match Information</h2><p>Move list and evaluation data are not available.</p></article></section>`
-    : `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>${active === "bracket" ? "Tournament Bracket" : "Leaderboard"}</h1><p>The current backend does not publish ${active === "bracket" ? "a tournament bracket" : "leaderboard standings"} to a spectator API. No entries or rankings are displayed.</p></section>`;
-  app.innerHTML = `<div class="spectator-app"><header class="spectator-header"><a class="spectator-brand" href="#arena" data-view="arena"><span>AI</span> KNOCKOUT<small>BY INVITATION ONLY</small></a><nav aria-label="Spectator navigation">${arenaNavigation.map(([key, label]) => `<button type="button" class="${active === key ? "active" : ""}" data-arena-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${label}</button>`).join("")}</nav><span class="spectator-unavailable">PUBLIC FEED UNAVAILABLE</span><button class="arena-return" type="button" data-view="participant">Participant access</button></header><main class="spectator-main">${content}</main></div>`;
+  app.innerHTML = `<div class="spectator-app"><header class="spectator-header"><a class="spectator-brand" href="#arena" data-view="arena"><span>AI</span> KNOCKOUT<small>BY INVITATION ONLY</small></a><nav aria-label="Spectator navigation">${arenaNavigation.map(([key, label]) => `<button type="button" class="${active === key ? "active" : ""}" data-arena-page="${key}" ${active === key ? 'aria-current="page"' : ""}>${label}</button>`).join("")}</nav><span class="spectator-unavailable" id="arena-feed-status">OFFICIAL ARENA</span><button class="arena-return" type="button" data-view="participant">Participant access</button></header><main class="spectator-main" id="arena-main"><div class="loading-copy" style="padding: 40px; text-align: center;">Loading spectator data…</div></main></div>`;
   app.querySelectorAll("[data-arena-page]").forEach((button) => button.addEventListener("click", () => renderArena(button.dataset.arenaPage)));
   app.querySelectorAll('[data-view="arena"]').forEach((button) => button.addEventListener("click", (event) => { event.preventDefault(); renderArena("live"); }));
   app.querySelector('[data-view="participant"]').addEventListener("click", returnToParticipantAccess);
+
+  if (active === "live") loadArenaLive();
+  else if (active === "bracket") loadArenaBracket();
+  else if (active === "leaderboard") loadArenaLeaderboard();
+}
+
+async function loadArenaLive() {
+  const target = app.querySelector("#arena-main");
+  if (!target) return;
+  try {
+    const matches = await api.tournamentMatches();
+    if (!target.isConnected) return;
+    const activeMatch = (matches.items || []).find((m) => m.state === "RUNNING" || m.state === "STARTING") || (matches.items || [])[0];
+    const liveItems = (matches.items || []).slice(0, 10);
+    target.innerHTML = `<section class="arena-hero"><div class="arena-copy"><span class="live-pill"><i></i> LIVE ARENA</span><h1>Two minds. One board.</h1><p>${activeMatch ? `Official Match #${esc(activeMatch.match_id.slice(0, 8))}` : "Tournament Official Arena"}</p><div class="arena-state"><strong>${activeMatch ? `${esc(activeMatch.white_participant?.name || "White")} vs ${esc(activeMatch.black_participant?.name || "Black")}` : "No match currently running"}</strong><span>${activeMatch ? `State: ${esc(activeMatch.state)} · ${activeMatch.current_ply} plies` : "Official match pairings will appear here during competition."}</span></div></div><div class="arena-board-placeholder">${activeMatch?.current_fen ? renderChessboard(activeMatch.current_fen) : `<div class="arena-empty-board" role="img" aria-label="Empty chessboard">${Array.from({ length: 64 }, (_, index) => `<span class="${(Math.floor(index / 8) + index % 8) % 2 ? "dark" : "light"}"></span>`).join("")}</div>`}<strong>${activeMatch ? `Status: ${esc(activeMatch.state)}` : "Live board waiting"}</strong><small>${activeMatch ? `Clock: ${formatClock(activeMatch.white_remaining_ms)} (W) / ${formatClock(activeMatch.black_remaining_ms)} (B)` : "Awaiting match broadcast."}</small></div></section><section class="arena-lower"><article class="arena-panel"><h2>Official Matches</h2>${liveItems.length ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Match</th><th>White</th><th>Black</th><th>Status</th><th>Result</th></tr></thead><tbody>${liveItems.map((m) => `<tr><td><code>${esc(m.match_id.slice(0, 8))}</code></td><td>${esc(m.white_participant?.name || "TBD")}</td><td>${esc(m.black_participant?.name || "TBD")}</td><td>${badge(m.state)}</td><td>${esc(m.result_outcome || "In progress")}</td></tr>`).join("")}</tbody></table></div>` : "<p>No official tournament matches recorded yet.</p>"}</article><article class="arena-panel"><h2>Event Information</h2><p>Official tournament matches are verified by python-chess and executed in isolated worker sandboxes with strict resource and time quotas.</p></article></section>`;
+  } catch (err) {
+    if (target.isConnected) target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>Live Arena</h1><p>Spectator feed is currently unavailable.</p></section>`;
+  }
+}
+
+async function loadArenaBracket() {
+  const target = app.querySelector("#arena-main");
+  if (!target) return;
+  try {
+    const data = await api.tournamentBracket();
+    if (!target.isConnected) return;
+    if (!data.rounds || !data.rounds.length) {
+      target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">OFFICIAL COMPETITION</span><h1>Tournament Bracket</h1><p>Elimination bracket will display here once official registration is frozen and matches begin.</p></section>`;
+      return;
+    }
+    target.innerHTML = `<section class="arena-lower" style="display: block; padding: 24px;"><span class="eyebrow">OFFICIAL COMPETITION</span><h1 style="color: var(--foreground); margin-bottom: 24px;">Tournament Bracket (${esc(data.total_participants)} participants)</h1>${data.rounds.map((round) => `<div style="margin-bottom: 32px;"><h3 style="color: var(--accent); margin-bottom: 12px; font-size: 1.1rem;">${esc(round.round_name)}</h3><div class="data-table-wrap"><table class="data-table"><thead><tr><th>Pairing</th><th>White</th><th>Black</th><th>Status</th><th>Winner / Outcome</th></tr></thead><tbody>${round.pairings.map((p) => `<tr><td>Match #${p.pairing_index + 1}</td><td><strong>${esc(p.white_participant?.name || "TBD")}</strong></td><td><strong>${esc(p.black_participant?.name || "TBD")}</strong></td><td>${badge(p.status || "PENDING")}</td><td>${p.winner ? `<strong>${esc(p.winner.name)}</strong>` : (p.status === "COMPLETED" ? "Draw" : "Pending")}</td></tr>`).join("")}</tbody></table></div></div>`).join("")}</section>`;
+  } catch {
+    if (target.isConnected) target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>Tournament Bracket</h1><p>Bracket data is currently unavailable.</p></section>`;
+  }
+}
+
+async function loadArenaLeaderboard() {
+  const target = app.querySelector("#arena-main");
+  if (!target) return;
+  try {
+    const data = await api.tournamentLeaderboard();
+    if (!target.isConnected) return;
+    if (!data.standings || !data.standings.length) {
+      target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">OFFICIAL COMPETITION</span><h1>Tournament Leaderboard</h1><p>Standings will update as tournament rounds conclude.</p></section>`;
+      return;
+    }
+    target.innerHTML = `<section class="arena-lower" style="display: block; padding: 24px;"><span class="eyebrow">OFFICIAL COMPETITION</span><h1 style="color: var(--foreground); margin-bottom: 24px;">Official Standings & Leaderboard</h1><div class="data-table-wrap"><table class="data-table"><thead><tr><th>Rank</th><th>Participant / AI</th><th>Status</th><th>Pts</th><th>W</th><th>D</th><th>L</th><th>S-B Tiebreak</th></tr></thead><tbody>${data.standings.map((s) => `<tr class="${s.status === "CHAMPION" ? "champion-row" : ""}"><td><strong>#${s.rank}</strong></td><td><strong>${esc(s.name)}</strong>${s.team_name ? ` <small>(${esc(s.team_name)})</small>` : ""}</td><td>${badge(s.status)}</td><td><strong>${s.points}</strong></td><td>${s.wins}</td><td>${s.draws}</td><td>${s.losses}</td><td>${s.sonneborn_berger.toFixed(2)}</td></tr>`).join("")}</tbody></table></div></section>`;
+  } catch {
+    if (target.isConnected) target.innerHTML = `<section class="arena-unavailable"><span class="eyebrow">PUBLIC COMPETITION DATA</span><h1>Tournament Leaderboard</h1><p>Leaderboard data is currently unavailable.</p></section>`;
+  }
 }
 
 function renderAdminUnavailable(active = "overview") {
@@ -653,15 +700,54 @@ function renderChessboard(fen) {
 }
 
 function renderResults(participant) {
-  shell(participant, "results", "Results", `<div class="page-tabs" aria-label="Competition views"><button class="button button-secondary" type="button" data-page="bracket">Tournament Bracket</button><button class="button button-secondary" type="button" data-page="leaderboard">Leaderboard</button></div><section class="card results-card"><div class="card-heading"><div><span class="eyebrow">DEVELOPMENT ONLY</span><h2>Completed Match Results</h2></div><button class="link-button" type="button" data-page="matches">All matches →</button></div><div id="results-list">Loading server result records…</div></section><div class="callout-note">Development results do not represent official tournament standings.</div>`);
+  shell(participant, "results", "Results", `<div class="page-tabs" aria-label="Competition views"><button class="button button-primary" type="button" data-page="results">Development Results</button><button class="button button-secondary" type="button" data-page="bracket">Tournament Bracket</button><button class="button button-secondary" type="button" data-page="leaderboard">Leaderboard</button></div><section class="card results-card"><div class="card-heading"><div><span class="eyebrow">DEVELOPMENT ONLY</span><h2>Completed Match Results</h2></div><button class="link-button" type="button" data-page="matches">All matches →</button></div><div id="results-list">Loading server result records…</div></section><div class="callout-note">Development results do not represent official tournament standings.</div>`);
   loadResults(participant);
 }
 
-function renderCompetitionUnavailable(participant, kind) {
-  const isBracket = kind === "bracket";
-  const title = isBracket ? "Tournament Bracket" : "Leaderboard";
-  const subject = isBracket ? "official bracket" : "official standings";
-  shell(participant, kind, title, `<section class="card unavailable-competition-card"><div class="empty-state-mark" aria-hidden="true">${isBracket ? "⌘" : "≡"}</div><span class="eyebrow">OFFICIAL COMPETITION DATA</span><h2>${title}</h2><p>The current participant API does not expose ${subject}. This view will show server-published data when that capability is available.</p><p class="unavailable-label">No bracket or ranking data is being inferred.</p><button class="button button-secondary" type="button" data-page="results">← Development results</button></section>`);
+function renderTournamentBracketView(participant) {
+  shell(participant, "bracket", "Tournament Bracket", `<div class="page-tabs" aria-label="Competition views"><button class="button button-secondary" type="button" data-page="results">Development Results</button><button class="button button-primary" type="button" data-page="bracket">Tournament Bracket</button><button class="button button-secondary" type="button" data-page="leaderboard">Leaderboard</button></div><section class="card bracket-card"><div class="card-heading"><div><span class="eyebrow">OFFICIAL COMPETITION</span><h2>Elimination Bracket</h2></div><div id="bracket-meta"></div></div><div id="bracket-content" class="loading-copy">Loading official tournament bracket…</div></section>`);
+  loadTournamentBracket(participant);
+}
+
+async function loadTournamentBracket(participant) {
+  const target = app.querySelector("#bracket-content");
+  const meta = app.querySelector("#bracket-meta");
+  if (!target) return;
+  try {
+    const data = await api.tournamentBracket();
+    if (!target.isConnected) return;
+    if (meta) meta.textContent = `${data.total_participants} participants · ${data.total_rounds} rounds`;
+    if (!data.rounds || !data.rounds.length) {
+      target.innerHTML = `<div class="empty-table-state">No tournament rounds generated yet. Official pairings appear when the tournament commences.</div>`;
+      return;
+    }
+    target.innerHTML = data.rounds.map((round) => `<div class="tournament-round-block" style="margin-bottom: 24px;"><h3 style="margin-bottom: 8px; font-size: 1rem; color: var(--accent);">${esc(round.round_name)}</h3><div class="data-table-wrap"><table class="data-table"><thead><tr><th>Pairing</th><th>White</th><th>Black</th><th>Status</th><th>Winner / Outcome</th></tr></thead><tbody>${round.pairings.map((p) => `<tr><td>Match #${p.pairing_index + 1}</td><td><strong>${esc(p.white_participant?.name || "TBD")}</strong></td><td><strong>${esc(p.black_participant?.name || "TBD")}</strong></td><td>${badge(p.status || "PENDING")}</td><td>${p.winner ? `<strong>${esc(p.winner.name)}</strong>` : (p.status === "COMPLETED" ? "Draw" : "Pending")}</td></tr>`).join("")}</tbody></table></div></div>`).join("");
+  } catch (error) {
+    if (!handleSessionError(error)) target.textContent = "Tournament bracket service is currently unavailable.";
+  }
+}
+
+function renderTournamentLeaderboardView(participant) {
+  shell(participant, "leaderboard", "Tournament Leaderboard", `<div class="page-tabs" aria-label="Competition views"><button class="button button-secondary" type="button" data-page="results">Development Results</button><button class="button button-secondary" type="button" data-page="bracket">Tournament Bracket</button><button class="button button-primary" type="button" data-page="leaderboard">Leaderboard</button></div><section class="card leaderboard-card"><div class="card-heading"><div><span class="eyebrow">OFFICIAL COMPETITION</span><h2>Tournament Standings</h2></div><div id="leaderboard-meta"></div></div><div id="leaderboard-content" class="loading-copy">Loading official standings…</div></section>`);
+  loadTournamentLeaderboard(participant);
+}
+
+async function loadTournamentLeaderboard(participant) {
+  const target = app.querySelector("#leaderboard-content");
+  const meta = app.querySelector("#leaderboard-meta");
+  if (!target) return;
+  try {
+    const data = await api.tournamentLeaderboard();
+    if (!target.isConnected) return;
+    if (meta) meta.textContent = `${data.total_participants} participants · ${data.total_matches} matches`;
+    if (!data.standings || !data.standings.length) {
+      target.innerHTML = `<div class="empty-table-state">No tournament standings recorded yet.</div>`;
+      return;
+    }
+    target.innerHTML = `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>Rank</th><th>Participant / AI</th><th>Status</th><th>Pts</th><th>W</th><th>D</th><th>L</th><th>S-B Tiebreak</th></tr></thead><tbody>${data.standings.map((s) => `<tr class="${s.status === "CHAMPION" ? "champion-row" : ""}"><td><strong>#${s.rank}</strong></td><td><strong>${esc(s.name)}</strong>${s.team_name ? ` <small>(${esc(s.team_name)})</small>` : ""}</td><td>${badge(s.status)}</td><td><strong>${s.points}</strong></td><td>${s.wins}</td><td>${s.draws}</td><td>${s.losses}</td><td>${s.sonneborn_berger.toFixed(2)}</td></tr>`).join("")}</tbody></table></div>`;
+  } catch (error) {
+    if (!handleSessionError(error)) target.textContent = "Tournament standings service is currently unavailable.";
+  }
 }
 
 async function loadResults(participant) {

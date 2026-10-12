@@ -134,3 +134,19 @@ test("development match creation binds exact request and idempotency key", async
     assert.equal(result.state, "QUEUED");
   } finally { restore(); }
 });
+
+test("tournament bracket and leaderboard use public tournament contracts", async () => {
+  const seen = [];
+  const restore = mockFetch(async (url, options) => {
+    seen.push([url, options]);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  });
+  try {
+    await api.tournamentBracket();
+    await api.tournamentLeaderboard();
+    assert.equal(seen[0][0], "/api/v1/tournaments/bracket");
+    assert.equal(seen[0][1].method, "GET");
+    assert.equal(seen[1][0], "/api/v1/tournaments/leaderboard");
+    assert.equal(seen[1][1].method, "GET");
+  } finally { restore(); }
+});

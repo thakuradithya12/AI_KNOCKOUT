@@ -93,6 +93,7 @@ async def create_match(
     white_submission_version_id: uuid.UUID,
     black_submission_version_id: uuid.UUID,
     configuration: MatchConfiguration,
+    purpose: MatchPurpose = MatchPurpose.PEER_TEST,
 ) -> tuple[Match, tuple[MatchSide, MatchSide]]:
     """Create an immutable, exact-version match. This does not enqueue executions."""
     if white_submission_version_id == black_submission_version_id:
@@ -142,6 +143,7 @@ async def create_match(
     match = Match(
         id=uuid.uuid4(),
         state=MatchState.QUEUED,
+        purpose=purpose,
         protocol_version=configuration.protocol_version,
         runtime_profile=configuration.runtime_profile,
         policy_version=configuration.policy_version,

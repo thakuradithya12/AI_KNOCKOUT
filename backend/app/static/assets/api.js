@@ -52,4 +52,8 @@ export const api = {
   }),
   developmentMatch: (token, matchId, signal) => request(`/participants/me/development-matches/${encodeURIComponent(matchId)}`, { token, signal }),
   logout: (token) => request("/auth/logout", { method: "POST", token }),
+  tournamentBracket: (signal) => request("/tournaments/bracket", { signal }),
+  tournamentLeaderboard: (signal) => request("/tournaments/leaderboard", { signal }),
+  tournamentMatches: (signal) => request("/tournaments/matches", { signal }),
+  tournamentMatch: (matchId, signal) => request(`/tournaments/matches/${encodeURIComponent(matchId)}`, { signal }),
 };
