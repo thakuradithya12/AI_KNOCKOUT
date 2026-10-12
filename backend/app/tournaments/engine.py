@@ -151,7 +151,13 @@ def compute_leaderboard_standings(
         for p in participants
     }
 
+    seen_matches: set[str] = set()
     for m in matches:
+        match_id = m.get("match_id")
+        if match_id:
+            if match_id in seen_matches:
+                continue
+            seen_matches.add(match_id)
         if m.get("state") not in {"COMPLETED", "ABORTED"}:
             continue
         white_id = m.get("white_participant_id")

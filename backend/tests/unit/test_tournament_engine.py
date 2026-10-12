@@ -186,3 +186,45 @@ def test_determine_match_winner():
     assert determine_match_winner("DRAW", "w1", "b1", draw_tiebreak_preference="WHITE") == "w1"
     assert determine_match_winner("DRAW", "w1", "b1", draw_tiebreak_preference="BLACK") == "b1"
     assert determine_match_winner(None, "w1", "b1") is None
+
+
+def test_bracket_generation_odd_and_even_counts():
+    for count in (1, 2, 3, 4, 5, 6, 7, 8):
+        parts = [_make_participant(f"P{i}", i) for i in range(1, count + 1)]
+        bracket = generate_single_elimination_bracket(parts)
+        assert bracket.total_participants == count
+        if count <= 2:
+            assert len(bracket.rounds) == 1
+        elif count <= 4:
+            assert len(bracket.rounds) == 2
+        elif count <= 8:
+            assert len(bracket.rounds) == 3
+
+
+def test_repeated_and_duplicate_match_handling_in_scoring():
+    p1 = _make_participant("P1", 1)
+    p2 = _make_participant("P2", 2)
+    m_id = str(uuid.uuid4())
+    matches = [
+        {
+            "match_id": m_id,
+            "white_participant_id": "part_p1",
+            "black_participant_id": "part_p2",
+            "state": "COMPLETED",
+            "result_outcome": "WHITE_WIN",
+            "result_reason": "CHECKMATE",
+        },
+        {
+            "match_id": m_id,  # duplicate record
+            "white_participant_id": "part_p1",
+            "black_participant_id": "part_p2",
+            "state": "COMPLETED",
+            "result_outcome": "WHITE_WIN",
+            "result_reason": "CHECKMATE",
+        },
+    ]
+    standings = compute_leaderboard_standings([p1, p2], matches)
+    p1_s = next(s for s in standings if s.participant_id == "part_p1")
+    assert p1_s.points == 1.0
+    assert p1_s.wins == 1
+    assert p1_s.matches_played == 1
