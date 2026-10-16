@@ -165,3 +165,8 @@ async def logout(
         )
 
     return {"status": "ok", "message": "Successfully logged out."}
+
+
+from app.api.v1.organizer_auth import router as organizer_auth_router
+
+router.include_router(organizer_auth_router, prefix="/organizer")

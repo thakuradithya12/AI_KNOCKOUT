@@ -340,6 +340,14 @@ class SandboxEvidence:
     started_monotonic: float | None
     observed_monotonic: float
     cleanup: CleanupResult | None
+    resource_usage: dict[str, int] = field(default_factory=dict)
+    unavailable_measurements: tuple[str, ...] = ()
+    measurement_error: str | None = None
+    measurement_source: str | None = None
+    measurement_scope: str | None = None
+    measurement_container_id: str | None = None
+    measurement_started_monotonic: float | None = None
+    measurement_ended_monotonic: float | None = None
     subject_kind: ExecutionSubjectKind = ExecutionSubjectKind.PARTICIPANT
     house_ai_id: str | None = None
     house_ai_version: int | None = None
@@ -842,6 +850,7 @@ class AIKTransport:
             "ready": {"protocol_version", "type", "request_id"},
             "ack": {"protocol_version", "type", "request_id"},
             "bestmove": {"protocol_version", "type", "request_id", "move"},
+            "move": {"protocol_version", "type", "request_id", "move"},
             "claim_draw": {"protocol_version", "type", "request_id", "reason", "intended_move"},
         }
         if message_type not in fields or set(parsed) != fields[message_type]:
@@ -853,7 +862,7 @@ class AIKTransport:
             or not 1 <= len(parsed["request_id"].encode("utf-8")) <= 64
         ):
             raise AIKProtocolError("MESSAGE_ID_INVALID")
-        if message_type == "bestmove":
+        if message_type in ("bestmove", "move"):
             move = parsed.get("move")
             if not isinstance(move, str) or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", move):
                 raise AIKProtocolError("MOVE_PROPOSAL_FORMAT_INVALID")

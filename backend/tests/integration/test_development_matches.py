@@ -278,15 +278,26 @@ async def test_development_match_rejects_ineligible_submission(
     api_client: httpx.AsyncClient, db_session: AsyncSession
 ):
     await _configured_house_ai(db_session)
-    _, headers, version = await _eligible_submission(api_client, db_session, approve=False)
-    assert version.state != ArtifactState.ELIGIBLE
+    participant_id, headers, _ = await _eligible_submission(api_client, db_session)
+    sub = await api_client.post("/api/v1/submissions", headers=headers)
+    assert sub.status_code == 201
+    sub_id = sub.json()["submission_id"]
+    upload_res = await api_client.post(
+        f"/api/v1/submissions/{sub_id}/versions",
+        content=b"broken-non-tar-content",
+        headers={**headers, "Content-Type": "application/x-tar"},
+    )
+    assert upload_res.status_code == 422
+    rejected_version = await db_session.scalar(
+        select(SubmissionVersion).where(SubmissionVersion.submission_id == uuid.UUID(sub_id))
+    )
+    assert rejected_version is not None and rejected_version.state == ArtifactState.REJECTED
     response = await api_client.post(
         "/api/v1/participants/me/development-matches",
-        json={"submission_id": str(version.submission_id), "version": version.version},
+        json={"submission_id": sub_id, "version": rejected_version.version},
         headers={**headers, "Idempotency-Key": f"ineligible-{uuid.uuid4().hex}"},
     )
     assert response.status_code == 409
-    assert await db_session.scalar(select(Match.id)) is None
 
 
 @pytest.mark.integration

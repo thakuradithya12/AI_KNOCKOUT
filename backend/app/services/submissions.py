@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -20,7 +21,12 @@ from app.models.competition import (
     ValidationAttempt,
     ValidationOutcome,
 )
-from app.models.event import BuildSession
+from app.models.event import (
+    BuildSession,
+    EventControl,
+    ParticipantSubmissionAllowance,
+    SubmissionAllowanceRequest,
+)
 from app.services.quarantine_storage import quarantine_storage
 from app.services.submission_validation import (
     POLICY_VERSION,
@@ -29,6 +35,17 @@ from app.services.submission_validation import (
     PackageRejected,
     validate_submission_package,
 )
+
+DEFAULT_SUBMISSION_LIMIT = 10
+
+
+class SubmissionLimitExceeded(Exception):
+    """Raised when participant has reached or exceeded their submission quota."""
+
+    def __init__(self, limit: int, current: int) -> None:
+        self.limit = limit
+        self.current = current
+        super().__init__(f"Submission quota of {limit} reached ({current} accepted).")
 
 
 class StorageIntegrityError(RuntimeError):
@@ -205,6 +222,292 @@ async def approve_submission_for_eligibility(
     return version
 
 
+async def get_or_create_allowance(
+    db: AsyncSession, participant_id: str, *, lock: bool = False
+) -> ParticipantSubmissionAllowance:
+    """Retrieve participant submission allowance, creating default record if missing."""
+    try:
+        stmt = select(ParticipantSubmissionAllowance).where(
+            ParticipantSubmissionAllowance.participant_id == participant_id
+        )
+        if lock:
+            stmt = stmt.with_for_update()
+        allowance = (await db.execute(stmt)).scalar_one_or_none()
+        if allowance is None:
+            allowance = ParticipantSubmissionAllowance(
+                participant_id=participant_id,
+                submission_limit=DEFAULT_SUBMISSION_LIMIT,
+            )
+            db.add(allowance)
+            await db.flush()
+        return allowance
+    except Exception:
+        await db.rollback()
+        return ParticipantSubmissionAllowance(
+            participant_id=participant_id,
+            submission_limit=DEFAULT_SUBMISSION_LIMIT,
+        )
+
+
+async def count_accepted_submissions(db: AsyncSession, participant_id: str) -> int:
+    """Count successfully accepted submissions for a participant.
+    
+    Only versions that passed static validation and entered APPROVED, ELIGIBLE,
+    or DEPRECATED states consume quota. REJECTED packages do not consume quota.
+    """
+    stmt = select(func.count(SubmissionVersion.id)).where(
+        SubmissionVersion.participant_id == participant_id,
+        SubmissionVersion.state.in_([
+            ArtifactState.APPROVED,
+            ArtifactState.ELIGIBLE,
+            ArtifactState.DEPRECATED,
+        ]),
+    )
+    return (await db.execute(stmt)).scalar_one() or 0
+
+
+async def get_participant_quota_summary(
+    db: AsyncSession, participant_id: str
+) -> dict:
+    """Summarize participant submission quota, usage, and allowance request status."""
+    try:
+        allowance = await get_or_create_allowance(db, participant_id)
+        accepted_count = await count_accepted_submissions(db, participant_id)
+        remaining = max(0, allowance.submission_limit - accepted_count)
+        pending_req = None
+        try:
+            pending_req = await db.scalar(
+                select(SubmissionAllowanceRequest).where(
+                    SubmissionAllowanceRequest.participant_id == participant_id,
+                    SubmissionAllowanceRequest.status == "PENDING",
+                ).order_by(SubmissionAllowanceRequest.created_at.desc()).limit(1)
+            )
+        except Exception:
+            await db.rollback()
+        return {
+            "participant_id": participant_id,
+            "submission_limit": allowance.submission_limit,
+            "accepted_submissions_count": accepted_count,
+            "remaining_submissions": remaining,
+            "has_pending_request": pending_req is not None,
+            "granted_by": allowance.granted_by,
+            "granted_at": allowance.granted_at,
+            "reason": allowance.reason,
+        }
+    except Exception:
+        await db.rollback()
+        return {
+            "participant_id": participant_id,
+            "submission_limit": DEFAULT_SUBMISSION_LIMIT,
+            "accepted_submissions_count": 0,
+            "remaining_submissions": DEFAULT_SUBMISSION_LIMIT,
+            "has_pending_request": False,
+            "granted_by": None,
+            "granted_at": None,
+            "reason": None,
+        }
+
+
+async def update_participant_allowance(
+    db: AsyncSession,
+    *,
+    participant_id: str,
+    new_limit: int,
+    actor_id: str,
+    reason: str,
+    correlation_id: str | None = None,
+) -> ParticipantSubmissionAllowance:
+    """Organizer directly adjusts a participant's submission allowance."""
+    if new_limit < 1:
+        raise ValueError("SUBMISSION_LIMIT_MUST_BE_POSITIVE")
+    if not actor_id or len(actor_id) > 64:
+        raise ValueError("ORGANIZER_ACTOR_INVALID")
+    if not reason or len(reason.strip()) == 0:
+        raise ValueError("ALLOWANCE_REASON_REQUIRED")
+    if len(reason) > 255:
+        raise ValueError("ALLOWANCE_REASON_TOO_LONG")
+
+    allowance = await get_or_create_allowance(db, participant_id, lock=True)
+    old_limit = allowance.submission_limit
+    allowance.submission_limit = new_limit
+    allowance.granted_by = actor_id
+    allowance.granted_at = _now()
+    allowance.reason = reason.strip()
+    allowance.updated_at = _now()
+
+    agg_id = uuid.uuid5(uuid.NAMESPACE_DNS, participant_id)
+    seq = await db.scalar(
+        select(func.max(CompetitionEvent.aggregate_sequence)).where(
+            CompetitionEvent.aggregate_type == "participant_submission_allowance",
+            CompetitionEvent.aggregate_id == agg_id,
+        )
+    )
+    db.add(
+        _event(
+            event_type="submission_allowance.updated",
+            actor_kind="organizer",
+            actor_id=actor_id,
+            aggregate_type="participant_submission_allowance",
+            aggregate_id=agg_id,
+            sequence=(seq or 0) + 1,
+            metadata={
+                "participant_id": participant_id,
+                "previous_limit": old_limit,
+                "new_limit": new_limit,
+                "reason": reason.strip(),
+            },
+            correlation_id=correlation_id,
+        )
+    )
+    await db.commit()
+    await db.refresh(allowance)
+    return allowance
+
+
+async def create_allowance_request(
+    db: AsyncSession,
+    *,
+    participant_id: str,
+    requested_limit: int,
+    reason: str,
+    correlation_id: str | None = None,
+) -> SubmissionAllowanceRequest:
+    """Participant submits a request for increased submission allowance."""
+    if requested_limit < 1:
+        raise ValueError("REQUESTED_LIMIT_MUST_BE_POSITIVE")
+    if not reason or len(reason.strip()) == 0:
+        raise ValueError("REQUEST_REASON_REQUIRED")
+    if len(reason) > 255:
+        raise ValueError("REQUEST_REASON_TOO_LONG")
+
+    allowance = await get_or_create_allowance(db, participant_id, lock=False)
+    if requested_limit <= allowance.submission_limit:
+        raise ValueError("REQUESTED_LIMIT_MUST_EXCEED_CURRENT_LIMIT")
+
+    existing = (
+        await db.execute(
+            select(SubmissionAllowanceRequest).where(
+                SubmissionAllowanceRequest.participant_id == participant_id,
+                SubmissionAllowanceRequest.status == "PENDING",
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise ValueError("PENDING_REQUEST_ALREADY_EXISTS")
+
+    req = SubmissionAllowanceRequest(
+        id=uuid.uuid4(),
+        participant_id=participant_id,
+        requested_limit=requested_limit,
+        reason=reason.strip(),
+        status="PENDING",
+        created_at=_now(),
+    )
+    db.add(req)
+    db.add(
+        _event(
+            event_type="submission_allowance.requested",
+            actor_kind="participant",
+            actor_id=participant_id,
+            aggregate_type="submission_allowance_request",
+            aggregate_id=req.id,
+            sequence=1,
+            metadata={
+                "participant_id": participant_id,
+                "requested_limit": requested_limit,
+                "reason": reason.strip(),
+            },
+            correlation_id=correlation_id,
+        )
+    )
+    await db.commit()
+    await db.refresh(req)
+    return req
+
+
+async def decide_allowance_request(
+    db: AsyncSession,
+    *,
+    request_id: uuid.UUID,
+    decision: str,
+    actor_id: str,
+    notes: str | None = None,
+    granted_limit: int | None = None,
+    correlation_id: str | None = None,
+) -> SubmissionAllowanceRequest:
+    """Organizer decides (approves/rejects) a participant's allowance request."""
+    decision = decision.upper()
+    if decision not in {"APPROVED", "REJECTED"}:
+        raise ValueError("DECISION_MUST_BE_APPROVED_OR_REJECTED")
+    if not actor_id or len(actor_id) > 64:
+        raise ValueError("ORGANIZER_ACTOR_INVALID")
+
+    req = (
+        await db.execute(
+            select(SubmissionAllowanceRequest)
+            .where(SubmissionAllowanceRequest.id == request_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if req is None:
+        raise LookupError("ALLOWANCE_REQUEST_NOT_FOUND")
+    if req.status != "PENDING":
+        raise ValueError("REQUEST_NOT_PENDING")
+
+    req.status = decision
+    req.reviewed_by = actor_id
+    req.reviewed_at = _now()
+    req.review_notes = notes[:255] if notes else None
+
+    effective_limit = granted_limit or req.requested_limit
+    if decision == "APPROVED":
+        if effective_limit < 1:
+            raise ValueError("GRANTED_LIMIT_MUST_BE_POSITIVE")
+        allowance = await get_or_create_allowance(db, req.participant_id, lock=True)
+        allowance.submission_limit = effective_limit
+        allowance.granted_by = actor_id
+        allowance.granted_at = _now()
+        allowance.reason = f"Approved request {req.id}: {notes or req.reason}"[:255]
+        allowance.updated_at = _now()
+
+    seq = await db.scalar(
+        select(func.max(CompetitionEvent.aggregate_sequence)).where(
+            CompetitionEvent.aggregate_type == "submission_allowance_request",
+            CompetitionEvent.aggregate_id == req.id,
+        )
+    )
+    db.add(
+        _event(
+            event_type=f"submission_allowance.{decision.lower()}",
+            actor_kind="organizer",
+            actor_id=actor_id,
+            aggregate_type="submission_allowance_request",
+            aggregate_id=req.id,
+            sequence=(seq or 0) + 1,
+            metadata={
+                "request_id": str(req.id),
+                "participant_id": req.participant_id,
+                "decision": decision,
+                "granted_limit": effective_limit if decision == "APPROVED" else None,
+                "notes": notes,
+            },
+            correlation_id=correlation_id,
+        )
+    )
+    await db.commit()
+    await db.refresh(req)
+    return req
+
+
+_upload_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_upload_lock(participant_id: str) -> asyncio.Lock:
+    if participant_id not in _upload_locks:
+        _upload_locks[participant_id] = asyncio.Lock()
+    return _upload_locks[participant_id]
+
+
 async def accept_upload(
     db: AsyncSession,
     *,
@@ -213,11 +516,41 @@ async def accept_upload(
     archive_bytes: bytes,
     correlation_id: str | None,
     limits: PackageLimits,
+    bypass_freeze: bool = False,
+    content_type: str | None = None,
+) -> UploadResult:
+    async with _get_upload_lock(participant_id):
+        return await _accept_upload_impl(
+            db,
+            participant_id=participant_id,
+            submission_id=submission_id,
+            archive_bytes=archive_bytes,
+            correlation_id=correlation_id,
+            limits=limits,
+            bypass_freeze=bypass_freeze,
+            content_type=content_type,
+        )
+
+
+async def _accept_upload_impl(
+    db: AsyncSession,
+    *,
+    participant_id: str,
+    submission_id: uuid.UUID,
+    archive_bytes: bytes,
+    correlation_id: str | None,
+    limits: PackageLimits,
+    bypass_freeze: bool = False,
+    content_type: str | None = None,
 ) -> UploadResult:
     # Lock the owner row to serialize version numbering on PostgreSQL.
     submission = await get_owned_submission(db, participant_id, submission_id, lock=True)
     if submission is None:
         raise LookupError("SUBMISSION_NOT_FOUND")
+
+    control = await db.scalar(select(EventControl).where(EventControl.id == 1))
+    if not bypass_freeze and control and control.official_freeze_at is not None:
+        raise ValueError("OFFICIAL_SUBMISSIONS_FROZEN")
 
     build_session = await db.scalar(
         select(BuildSession)
@@ -227,6 +560,14 @@ async def accept_upload(
     if build_session is None:
         raise LookupError("BUILD_SESSION_NOT_FOUND")
     submitted_at = _now()
+
+    from app.sandbox.participant_adapter import wrap_submission_if_needed
+
+    rejection: PackageRejected | None = None
+    try:
+        archive_bytes = wrap_submission_if_needed(archive_bytes, limits, content_type=content_type)
+    except PackageRejected as exc:
+        rejection = exc
 
     digest = hashlib.sha256(archive_bytes).hexdigest()
     existing_version = (
@@ -257,14 +598,25 @@ async def accept_upload(
         ).scalar_one()
         return UploadResult(existing_version, attempt, True)
 
+    # Enforce submission quota with row-level lock on participant allowance.
+    allowance = await get_or_create_allowance(db, participant_id, lock=True)
+    accepted_count = await count_accepted_submissions(db, participant_id)
+    if accepted_count >= allowance.submission_limit:
+        raise SubmissionLimitExceeded(
+            limit=allowance.submission_limit,
+            current=accepted_count,
+        )
+
     started_at = _now()
-    rejection: PackageRejected | None = None
-    try:
-        package = validate_submission_package(archive_bytes, limits)
-        manifest: dict | None = package.manifest
-    except PackageRejected as exc:
-        rejection = exc
-        manifest = _safe_manifest_snapshot(exc.manifest)
+    if rejection is None:
+        try:
+            package = validate_submission_package(archive_bytes, limits)
+            manifest: dict | None = package.manifest
+        except PackageRejected as exc:
+            rejection = exc
+            manifest = _safe_manifest_snapshot(exc.manifest)
+    else:
+        manifest = None
 
     # Quarantine bytes and all corresponding metadata/events commit atomically.
     # The logical storage key is backend-neutral; the current zero-budget adapter

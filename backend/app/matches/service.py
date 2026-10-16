@@ -21,6 +21,7 @@ from app.models.match import (
     MatchFailure,
     MatchMove,
     MatchPurpose,
+    MatchResultSource,
     MatchSide,
     MatchSideColor,
     MatchSideKind,
@@ -52,6 +53,14 @@ def _now() -> datetime:
 
 def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+def _apply_automated_result(match: Match, result, completed_at: datetime) -> None:
+    """Persist result fields only from a trusted MatchController result object."""
+    match.result_outcome = result.outcome.value
+    match.result_reason = result.reason.value
+    match.result_source = MatchResultSource.AUTOMATED
+    match.completed_at = completed_at
 
 
 def _event(
@@ -247,8 +256,9 @@ async def begin_initialization(db: AsyncSession, match_id: uuid.UUID) -> Match:
         and set(kinds) != {MatchSideKind.PARTICIPANT}
     ) or (
         match.purpose == MatchPurpose.DEVELOPMENT
-        and sorted(kind.value for kind in kinds) != sorted(
-            [MatchSideKind.PARTICIPANT.value, MatchSideKind.HOUSE_AI.value]
+        and sorted(kind.value for kind in kinds) not in (
+            sorted([MatchSideKind.PARTICIPANT.value, MatchSideKind.HOUSE_AI.value]),
+            [MatchSideKind.HOUSE_AI.value, MatchSideKind.HOUSE_AI.value],
         )
     ):
         raise MatchServiceError("MATCH_PURPOSE_SIDE_COMPOSITION_INVALID")
@@ -756,9 +766,7 @@ async def persist_controller_update(db: AsyncSession, controller) -> Match:
     if match.started_at is None and controller.started_at is not None:
         match.started_at = controller.started_at
     if controller.result is not None:
-        match.result_outcome = controller.result.outcome.value
-        match.result_reason = controller.result.reason.value
-        match.completed_at = controller.completed_at or _now()
+        _apply_automated_result(match, controller.result, controller.completed_at or _now())
     if controller.failure is not None:
         match.failure_reason = controller.failure.value
         match.completed_at = controller.completed_at or _now()

@@ -140,7 +140,10 @@ async def run_local_end_to_end_match():
     print("=" * 70)
 
     # 1. Connect to isolated local database
-    db_url = "postgresql+asyncpg://aik_user:1029N19gmiqVP7qP585J4XN1wHLfrdnuzAkpXh0lDuE@127.0.0.1:5433/aik_e2e_dev"
+    db_url = os.environ.get(
+        "DATABASE_URL",
+        "postgresql+asyncpg://aik_user:1029N19gmiqVP7qP585J4XN1wHLfrdnuzAkpXh0lDuE@127.0.0.1:5433/aik_e2e_dev",
+    )
     normalized_db_url = normalize_async_database_url(db_url)
     connect_args = get_asyncpg_connect_args(db_url)
     engine = create_async_engine(normalized_db_url, connect_args=connect_args, pool_pre_ping=True)

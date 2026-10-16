@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     StrictStr,
     field_validator,
@@ -30,12 +31,12 @@ class StrictModel(BaseModel):
 
 
 class WorkerCapabilities(StrictModel):
-    sandbox_backend: Literal["KATA", "MOCK_TEST_ONLY"]
+    sandbox_backend: Literal["KATA", "MODAL", "MOCK_TEST_ONLY"]
     sandbox_version: StrictStr = Field(min_length=1, max_length=128)
     sandbox_digest: StrictStr = Field(pattern="^[0-9a-f]{64}$")
     protocol_versions: list[StrictStr] = Field(max_length=8)
-    execution_modes: list[Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"]] = Field(
-        default_factory=lambda: ["MOCK_PROTOCOL_ONLY"], max_length=2
+    execution_modes: list[Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION", "MODAL_AI_EXECUTION"]] = Field(
+        default_factory=lambda: ["MOCK_PROTOCOL_ONLY"], max_length=3
     )
 
     @field_validator("protocol_versions")
@@ -157,6 +158,15 @@ class EvidenceIn(LeaseOperation):
     failure_class: ExecutionFailureClass | None = None
     termination_reason: StrictStr | None = Field(default=None, max_length=64)
     resource_usage: dict[str, StrictInt] = Field(default_factory=dict)
+    resource_measurement_source: Literal["cgroup-v2"] | None = None
+    resource_measurement_scope: Literal["execution-cgroup-host-tasks"] | None = None
+    resource_measurement_container_id: StrictStr | None = Field(
+        default=None, pattern="^aik-[0-9a-f]{32}$", max_length=36
+    )
+    resource_measurement_started_monotonic: StrictFloat | None = Field(default=None, ge=0)
+    resource_measurement_ended_monotonic: StrictFloat | None = Field(default=None, ge=0)
+    unavailable_measurements: list[StrictStr] = Field(default_factory=list, max_length=8)
+    measurement_error: StrictStr | None = Field(default=None, pattern="^[A-Z0-9_]{1,64}$")
     artifact_digest_verified: StrictBool = False
     stdout_bytes: StrictInt = Field(default=0, ge=0, le=1048576)
     stdout_sha256: StrictStr | None = None
@@ -191,10 +201,59 @@ class EvidenceIn(LeaseOperation):
     @field_validator("resource_usage")
     @classmethod
     def validate_resource_names(cls, value: dict[str, int]) -> dict[str, int]:
-        allowed = {"cpu_usec", "memory_peak_bytes", "pids_peak", "tmpfs_peak_bytes"}
+        allowed = {
+            "cpu_usec",
+            "cpu_millicores",
+            "memory_current_bytes",
+            "memory_peak_bytes",
+            "pids_current",
+            "pids_peak",
+            "tmpfs_peak_bytes",
+        }
         if set(value) - allowed or any(v < 0 for v in value.values()):
             raise ValueError("unsupported resource usage fields")
         return value
+
+    @field_validator("unavailable_measurements")
+    @classmethod
+    def validate_unavailable_measurements(cls, value: list[str]) -> list[str]:
+        allowed = {
+            "process_count",
+            "memory_bytes",
+            "filesystem_bytes",
+            "filesystem_inodes",
+            "file_descriptors",
+            "cpu_millicores",
+            "memory_peak_bytes",
+            "pids_peak",
+        }
+        if len(value) != len(set(value)) or set(value) - allowed:
+            raise ValueError("unsupported or duplicate unavailable measurement")
+        return value
+
+    @model_validator(mode="after")
+    def validate_measurement_provenance(self):
+        provenance = (
+            self.resource_measurement_source,
+            self.resource_measurement_scope,
+            self.resource_measurement_container_id,
+            self.resource_measurement_started_monotonic,
+            self.resource_measurement_ended_monotonic,
+        )
+        if any(value is not None for value in provenance) and any(
+            value is None for value in provenance
+        ):
+            raise ValueError("resource measurement provenance must be complete")
+        if (
+            self.resource_measurement_started_monotonic is not None
+            and self.resource_measurement_ended_monotonic
+            < self.resource_measurement_started_monotonic
+        ):
+            raise ValueError("resource measurement interval must be ordered")
+        if self.resource_measurement_source is None and not self.measurement_error:
+            if self.resource_usage or self.unavailable_measurements:
+                raise ValueError("resource values require explicit measurement provenance")
+        return self
 
 
 class CleanupIn(LeaseOperation):
@@ -212,7 +271,7 @@ class WorkerOperationOut(StrictModel):
 
 class JobOut(StrictModel):
     execution_id: uuid.UUID
-    execution_mode: Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"]
+    execution_mode: Literal["MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION", "MODAL_AI_EXECUTION"]
     execution_kind: Literal["PARTICIPANT", "HOUSE_AI"]
     match_id: uuid.UUID | None
     match_side_id: uuid.UUID | None = None

@@ -27,7 +27,7 @@ from app.core.security import (
     generate_session_token,
     hash_token,
 )
-from app.models.event import BuildSession
+from app.models.event import BuildSession, ParticipantSubmissionAllowance
 from app.models.participant import (
     AuthEvent,
     AuthEventType,
@@ -60,12 +60,12 @@ class AuthService:
         """
         try:
             event = AuthEvent(
-                participant_id=participant_id,
+                participant_id=participant_id[:32] if participant_id else None,
                 event_type=event_type,
-                ip_address=ip_address,
+                ip_address=ip_address[:45] if ip_address else None,
                 user_agent=user_agent[:255] if user_agent else None,
-                request_id=request_id,
-                details=details,
+                request_id=request_id[:64] if request_id else None,
+                details=details[:255] if details else None,
                 created_at=datetime.now(timezone.utc),
             )
             db.add(event)
@@ -144,6 +144,17 @@ class AuthService:
                     start_source="REGISTRATION",
                 )
             )
+            try:
+                async with db.begin_nested():
+                    db.add(
+                        ParticipantSubmissionAllowance(
+                            participant_id=participant_id,
+                            submission_limit=10,
+                        )
+                    )
+                    await db.flush()
+            except Exception:
+                pass
             await db.flush()
 
             # 5. Record audit event

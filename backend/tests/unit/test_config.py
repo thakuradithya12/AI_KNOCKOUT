@@ -90,6 +90,32 @@ class TestConfigValidation:
         with pytest.raises(ValidationError, match="echo"):
             Settings(_env_file=None)  # type: ignore[call-arg]
 
+    def test_staging_uses_deployed_security_defaults(self, monkeypatch):
+        monkeypatch.setenv("SECRET_KEY", "a" * 64)
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/db")
+        monkeypatch.setenv("APP_ENV", "  STAGING  ")
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "https://event.example")
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.app_env == "staging"
+        assert settings.is_deployed
+        assert not settings.is_production
+
+    def test_staging_rejects_wildcard_cors(self, monkeypatch):
+        monkeypatch.setenv("SECRET_KEY", "a" * 64)
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/db")
+        monkeypatch.setenv("APP_ENV", "staging")
+        monkeypatch.setenv("CORS_ALLOWED_ORIGINS", "*")
+        with pytest.raises(ValidationError, match="Wildcard"):
+            Settings(_env_file=None)  # type: ignore[call-arg]
+
+    def test_staging_rejects_db_echo(self, monkeypatch):
+        monkeypatch.setenv("SECRET_KEY", "a" * 64)
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://user:pass@localhost/db")
+        monkeypatch.setenv("APP_ENV", "staging")
+        monkeypatch.setenv("DB_ECHO", "true")
+        with pytest.raises(ValidationError, match="echo"):
+            Settings(_env_file=None)  # type: ignore[call-arg]
+
     def test_missing_secret_key_fails(self, monkeypatch):
         """Missing SECRET_KEY must fail."""
         monkeypatch.delenv("SECRET_KEY", raising=False)

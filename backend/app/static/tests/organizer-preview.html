@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Organizer Matches — Mock Preview</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=ui-20261014-02">
+</head>
+<body>
+  <main class="admin-app organizer-preview-shell">
+    <header class="admin-header">
+      <a class="brand" href="#preview"><span class="brand-mark">AI</span><span class="brand-word">KNOCKOUT<small>LOCAL UI PREVIEW</small></span></a>
+      <span class="status-badge warning">MOCK DATA ONLY</span>
+    </header>
+    <div class="admin-main">
+      <section class="admin-empty" role="note">
+        <strong>Mock preview — no server or participant data is connected.</strong>
+        <p>This page exists only to inspect the organizer Matches layout. Result actions are deliberately disabled.</p>
+      </section>
+      <section aria-labelledby="organizer-matches-heading">
+        <div class="page-heading">
+          <div><span class="eyebrow">TOURNAMENT OPERATIONS</span><h1 id="organizer-matches-heading">Matches</h1></div>
+          <span class="status-badge neutral">Read-only mock records</span>
+        </div>
+        <div id="organizer-match-management"></div>
+      </section>
+    </div>
+  </main>
+  <script type="module">
+    import { renderOrganizerMatchManagement } from "/assets/organizerMatchManagement.js?v=ui-20261014-02";
+    const mockMatches = [
+      { match_id: "MOCK-MATCH-001", state: "IN_PROGRESS", white_name: "Mock White", white_participant_id: "MOCK-P-01", black_name: "Mock Black", black_participant_id: "MOCK-P-02" },
+      { match_id: "MOCK-MATCH-002", state: "COMPLETED", result_outcome: "DRAW", result_reason: "STALEMATE", white_name: "Mock Player A", black_name: "Mock Player B" },
+    ];
+    document.querySelector("#organizer-match-management").innerHTML = renderOrganizerMatchManagement(mockMatches, { integrationAvailable: false });
+  </script>
+</body>
+</html>

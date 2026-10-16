@@ -1025,7 +1025,18 @@ async def test_evidence_is_bounded_append_only_and_cannot_set_match_result(
                 "sequence": 2,
                 "event_type": "RESOURCE_LIMIT",
                 "failure_class": "RESOURCE_EXHAUSTION",
-                "resource_usage": {"pids_peak": 16},
+                "resource_usage": {
+                    "cpu_usec": 0,
+                    "memory_current_bytes": 0,
+                    "pids_current": 0,
+                    "pids_peak": 0,
+                },
+                "resource_measurement_source": "cgroup-v2",
+                "resource_measurement_scope": "execution-cgroup-host-tasks",
+                "resource_measurement_container_id": f"aik-{job.execution_id.hex}",
+                "resource_measurement_started_monotonic": 1.0,
+                "resource_measurement_ended_monotonic": 2.0,
+                "unavailable_measurements": ["filesystem_bytes", "filesystem_inodes"],
                 "stdout_bytes": 42,
                 "stdout_sha256": "b" * 64,
             },
@@ -1045,6 +1056,13 @@ async def test_evidence_is_bounded_append_only_and_cannot_set_match_result(
     stored = (await db_session.execute(select(WorkerEvidence))).scalars().all()
     assert len(stored) == 1
     assert stored[0].stdout_bytes == 42
+    assert stored[0].resource_usage["memory_current_bytes"] == 0
+    assert stored[0].evidence_json["measurement_source"] == "cgroup-v2"
+    assert stored[0].evidence_json["measurement_container_id"] == f"aik-{job.execution_id.hex}"
+    assert stored[0].evidence_json["unavailable_measurements"] == [
+        "filesystem_bytes",
+        "filesystem_inodes",
+    ]
     assert "stdout" not in stored[0].evidence_json
     stored[0].event_type = "MUTATED"
     with pytest.raises(ValueError, match="WORKER_AUDIT_RECORD_APPEND_ONLY"):
@@ -1246,6 +1264,7 @@ def test_mtls_contexts_require_ca_and_client_identity(tmp_path, monkeypatch):
             serialization.NoEncryption(),
         )
     )
+    server_key_file.chmod(0o600)  # TLS loader rejects group/world-readable keys on POSIX
     client_file.write_bytes(client_cert.public_bytes(serialization.Encoding.PEM))
     client_key_file.write_bytes(
         client_key.private_bytes(
@@ -1254,6 +1273,7 @@ def test_mtls_contexts_require_ca_and_client_identity(tmp_path, monkeypatch):
             serialization.NoEncryption(),
         )
     )
+    client_key_file.chmod(0o600)  # TLS loader rejects group/world-readable keys on POSIX
     ca_file.write_bytes(_CA_CERT.public_bytes(serialization.Encoding.PEM))
     for name in (
         "WORKER_TLS_ENABLED",
@@ -1348,3 +1368,291 @@ def test_hypercorn_listener_context_pins_tls12_and_requires_client_cert(monkeypa
 async def test_worker_gateway_routes_are_not_mounted_on_participant_api(api_client):
     response = await api_client.post("/worker/v1/jobs/claim")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_control_authority_match_purpose_authorization_and_fencing(
+    db_session: AsyncSession, test_session_factory
+):
+    from app.models.event import TournamentPairingRecord, TournamentRoundRecord
+    from app.models.match import (
+        Match,
+        MatchPurpose,
+        MatchSide,
+        MatchSideColor,
+        MatchSideKind,
+        MatchState,
+        ParticipantMatchSideBinding,
+    )
+    from app.models.worker import ExecutionKind, ExecutionJobStatus, WorkerExecutionJob
+    from app.workers.gateway import _control_authority
+
+    worker, pem, _ = await _enroll(
+        db_session, test_session_factory, worker_id=f"worker-{uuid.uuid4().hex[:8]}"
+    )
+    version, _ = await _eligible_fixture_version(db_session)
+    now = datetime.now(timezone.utc)
+
+    match_id = uuid.uuid4()
+    match = Match(
+        id=match_id,
+        state=MatchState.QUEUED,
+        purpose=MatchPurpose.OFFICIAL,
+        protocol_version="aik-jsonl/1",
+        runtime_profile="python-3.12",
+        policy_version="development-v1",
+        rules_version="standard-chess/python-chess-1.11.2",
+        match_seed="0" * 64,
+        initial_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        current_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        side_to_move=MatchSideColor.WHITE,
+        current_ply=0,
+        initial_clock_ms=180000,
+        increment_ms=2000,
+        move_timeout_ms=3000,
+        white_remaining_ms=180000,
+        black_remaining_ms=180000,
+        created_at=now,
+        started_at=None,
+    )
+    db_session.add(match)
+
+    side_id = uuid.uuid4()
+    side = MatchSide(
+        id=side_id,
+        match_id=match_id,
+        color=MatchSideColor.WHITE,
+        kind=MatchSideKind.PARTICIPANT,
+        protocol_version="aik-jsonl/1",
+        runtime_profile="python-3.12",
+        created_at=now,
+    )
+    binding = ParticipantMatchSideBinding(
+        match_side_id=side_id,
+        participant_id=version.participant_id,
+        submission_id=version.submission_id,
+        submission_version_id=version.id,
+        artifact_sha256=version.artifact_sha256,
+    )
+    db_session.add_all([side, binding])
+
+    lease_id = uuid.uuid4()
+    execution_id = uuid.uuid4()
+    job = WorkerExecutionJob(
+        id=uuid.uuid4(),
+        execution_id=execution_id,
+        match_id=match_id,
+        execution_kind=ExecutionKind.PARTICIPANT,
+        participant_id=version.participant_id,
+        submission_id=version.submission_id,
+        submission_version=1,
+        submission_version_id=version.id,
+        artifact_sha256=version.artifact_sha256,
+        immutable_artifact_ref=version.artifact_sha256,
+        runtime_profile="python-3.12",
+        protocol_version="aik-jsonl/1",
+        execution_mode="KATA_AI_EXECUTION",
+        initial_state={"purpose": "OFFICIAL"},
+        resource_policy={"move_timeout_ms": 2000, "process_lifetime_ms": 900000, "concurrency_per_worker": 1},
+        execution_expires_at=now + timedelta(minutes=5),
+        status=ExecutionJobStatus.ACKNOWLEDGED,
+        assigned_worker_id=worker.worker_id,
+        lease_id=lease_id,
+        fencing_token=1,
+        lease_expires_at=now + timedelta(minutes=1),
+        last_sequence=0,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    # 1. Unauthorized official match (no TournamentPairingRecord) -> 403 UNAUTHORIZED_OFFICIAL_MATCH
+    with pytest.raises(WorkerProtocolError) as exc_unauth:
+        await _control_authority(
+            db_session,
+            worker=worker,
+            execution_id=execution_id,
+            lease_id=lease_id,
+            fence=1,
+            attempt=1,
+        )
+    assert exc_unauth.value.status_code == 403
+    assert exc_unauth.value.code == "UNAUTHORIZED_OFFICIAL_MATCH"
+
+    # 2. Authorized official match (with TournamentPairingRecord) -> succeeds
+    round_record = TournamentRoundRecord(
+        id=uuid.uuid4(),
+        tournament_id="official-v1",
+        stage="SWISS",
+        round_number=1,
+        round_name="Swiss Round 1",
+        status="IN_PROGRESS",
+    )
+    db_session.add(round_record)
+    pairing = TournamentPairingRecord(
+        id=uuid.uuid4(),
+        round_id=round_record.id,
+        pairing_index=1,
+        stage_name="SWISS",
+        participant1_id=version.participant_id,
+        participant2_id=version.participant_id,
+        game1_match_id=match_id,
+        status="QUEUED",
+    )
+    db_session.add(pairing)
+    await db_session.commit()
+
+    res = await _control_authority(
+        db_session,
+        worker=worker,
+        execution_id=execution_id,
+        lease_id=lease_id,
+        fence=1,
+        attempt=1,
+    )
+    assert res["match_id"] == str(match_id)
+    assert res["worker_id"] == worker.worker_id
+    assert res["fence_token"] == 1
+
+    # 3. Conflicting fencing token -> 409 WORKER_FENCE_STALE
+    with pytest.raises(WorkerProtocolError) as exc_stale:
+        await _control_authority(
+            db_session,
+            worker=worker,
+            execution_id=execution_id,
+            lease_id=lease_id,
+            fence=2,
+            attempt=1,
+        )
+    assert exc_stale.value.status_code == 409
+    assert exc_stale.value.code == "STALE_FENCING_TOKEN"
+
+    # 4. Expired lease -> 409 EXECUTION_LEASE_EXPIRED
+    job.lease_expires_at = now - timedelta(seconds=1)
+    await db_session.commit()
+    with pytest.raises(WorkerProtocolError) as exc_expired:
+        await _control_authority(
+            db_session,
+            worker=worker,
+            execution_id=execution_id,
+            lease_id=lease_id,
+            fence=1,
+            attempt=1,
+        )
+    assert exc_expired.value.status_code == 409
+    assert exc_expired.value.code == "EXECUTION_LEASE_EXPIRED"
+
+    # Reset lease
+    job.lease_expires_at = now + timedelta(minutes=1)
+    await db_session.commit()
+
+    # 5. Purpose mismatch -> 409 MATCH_PURPOSE_MISMATCH
+    match2_id = uuid.uuid4()
+    match2 = Match(
+        id=match2_id,
+        state=MatchState.QUEUED,
+        purpose=MatchPurpose.OFFICIAL,
+        protocol_version="aik-jsonl/1",
+        runtime_profile="python-3.12",
+        policy_version="development-v1",
+        rules_version="standard-chess/python-chess-1.11.2",
+        match_seed="1" * 64,
+        initial_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        current_fen="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        side_to_move=MatchSideColor.WHITE,
+        current_ply=0,
+        initial_clock_ms=180000,
+        increment_ms=2000,
+        move_timeout_ms=3000,
+        white_remaining_ms=180000,
+        black_remaining_ms=180000,
+        created_at=now,
+        started_at=None,
+    )
+    side2_id = uuid.uuid4()
+    side2 = MatchSide(
+        id=side2_id,
+        match_id=match2_id,
+        color=MatchSideColor.WHITE,
+        kind=MatchSideKind.PARTICIPANT,
+        protocol_version="aik-jsonl/1",
+        runtime_profile="python-3.12",
+        created_at=now,
+    )
+    binding2 = ParticipantMatchSideBinding(
+        match_side_id=side2_id,
+        participant_id=version.participant_id,
+        submission_id=version.submission_id,
+        submission_version_id=version.id,
+        artifact_sha256=version.artifact_sha256,
+    )
+    db_session.add_all([match2, side2, binding2])
+
+    mismatch_job = WorkerExecutionJob(
+        id=uuid.uuid4(),
+        execution_id=uuid.uuid4(),
+        match_id=match2_id,
+        execution_kind=ExecutionKind.PARTICIPANT,
+        participant_id=version.participant_id,
+        submission_id=version.submission_id,
+        submission_version=1,
+        submission_version_id=version.id,
+        artifact_sha256=version.artifact_sha256,
+        immutable_artifact_ref=version.artifact_sha256,
+        runtime_profile="python-3.12",
+        protocol_version="aik-jsonl/1",
+        execution_mode="KATA_AI_EXECUTION",
+        initial_state={"purpose": "DEVELOPMENT"},
+        resource_policy={"move_timeout_ms": 2000, "process_lifetime_ms": 900000, "concurrency_per_worker": 1},
+        execution_expires_at=now + timedelta(minutes=5),
+        status=ExecutionJobStatus.ACKNOWLEDGED,
+        assigned_worker_id=worker.worker_id,
+        lease_id=uuid.uuid4(),
+        fencing_token=1,
+        lease_expires_at=now + timedelta(minutes=1),
+        last_sequence=0,
+    )
+    db_session.add(mismatch_job)
+    await db_session.commit()
+    with pytest.raises(WorkerProtocolError) as exc_mismatch:
+        await _control_authority(
+            db_session,
+            worker=worker,
+            execution_id=mismatch_job.execution_id,
+            lease_id=mismatch_job.lease_id,
+            fence=1,
+            attempt=1,
+        )
+    assert exc_mismatch.value.status_code == 409
+    assert exc_mismatch.value.code == "MATCH_PURPOSE_MISMATCH"
+
+    # 6. Unsupported match purpose -> 409 UNSUPPORTED_MATCH_PURPOSE
+    from unittest.mock import AsyncMock, MagicMock
+    fake_job = MagicMock()
+    fake_job.execution_id = mismatch_job.execution_id
+    fake_job.assigned_worker_id = worker.worker_id
+    fake_job.lease_id = mismatch_job.lease_id
+    fake_job.fencing_token = 1
+    fake_job.lease_expires_at = now + timedelta(minutes=1)
+    fake_job.execution_expires_at = now + timedelta(minutes=5)
+    fake_job.status = ExecutionJobStatus.ACKNOWLEDGED
+    fake_job.match_id = match2_id
+    fake_job.execution_kind = ExecutionKind.PARTICIPANT
+    fake_job.initial_state = {"purpose": "CUSTOM_PURPOSE"}
+
+    mock_db = AsyncMock()
+    mock_db.scalar.side_effect = [fake_job, side2_id, 1]
+    fake_match = MagicMock()
+    fake_match.purpose = "CUSTOM_PURPOSE"
+    mock_db.get.side_effect = [side2, fake_match]
+    with pytest.raises(WorkerProtocolError) as exc_unsupported:
+        await _control_authority(
+            mock_db,
+            worker=worker,
+            execution_id=fake_job.execution_id,
+            lease_id=fake_job.lease_id,
+            fence=1,
+            attempt=1,
+        )
+    assert exc_unsupported.value.status_code == 409
+    assert exc_unsupported.value.code == "UNSUPPORTED_MATCH_PURPOSE"
+

@@ -26,6 +26,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from app.sandbox.cgroup_v2 import (
+    CgroupEvidenceError,
+    CgroupV2Sample,
+    collect_cgroup_v2_sample,
+    verify_cgroup_v2_limits,
+)
 from app.sandbox.contract import (
     _TERMINAL,
     AIKMessage,
@@ -101,6 +107,10 @@ class _Execution:
     output: queue.Queue | None = None
     lock: threading.RLock | None = None
     reader_threads: list[threading.Thread] | None = None
+    container_id: str | None = None
+    cgroup_start_sample: CgroupV2Sample | None = None
+    measurement_started_monotonic: float | None = None
+    resource_evidence: SandboxEvidence | None = None
     stdin_total: int = 0
     last_input_at: float | None = None
     completion_code: int | None = None
@@ -594,6 +604,7 @@ class KataSandboxAdapter:
         if eligible is not True:
             raise IdentityMismatchError("ARTIFACT_NOT_ELIGIBLE_AT_LAUNCH")
         container_id = f"aik-{execution_id.hex}"
+        record.container_id = container_id
         # A previous worker process may have died while leaving containerd state
         # behind. Never let ctr reuse an execution name across worker lifetimes.
         if self._listed("containers", container_id) or self._listed("tasks", container_id):
@@ -665,8 +676,9 @@ class KataSandboxAdapter:
 
     @staticmethod
     def _sandbox_uid(execution_id: uuid.UUID) -> str:
-        # Unique unprivileged guest UID makes RLIMIT_NPROC execution-scoped.
-        uid = 100_000 + (int(execution_id.hex[:6], 16) % 10_000_000)
+        # Use the complete execution identity to make accidental UID collisions
+        # far less likely. The cgroup pids.max limit remains the hard process cap.
+        uid = 100_000 + (execution_id.int % 2_000_000_000)
         return f"{uid}:{uid}"
 
     @staticmethod
@@ -688,7 +700,7 @@ class KataSandboxAdapter:
         if not (parent / "cgroup.controllers").exists():
             raise KataRuntimeError("CGROUP_V2_UNAVAILABLE")
         available = set((parent / "cgroup.controllers").read_text(encoding="ascii").split())
-        if not {"cpu", "pids"}.issubset(available):
+        if not {"cpu", "memory", "pids"}.issubset(available):
             raise KataRuntimeError("REQUIRED_CGROUP_CONTROLLERS_UNAVAILABLE")
         target = parent / f"aik-{record.identity.execution_id.hex}"
         try:
@@ -698,16 +710,31 @@ class KataSandboxAdapter:
             (target / "cpu.max").write_text(
                 f"{record.policy.cpu_millicores * 100} 100000", encoding="ascii"
             )
-            if (target / "pids.max").read_text(encoding="ascii").strip() != str(
-                record.policy.pid_limit
-            ):
-                raise OSError("PID limit readback mismatch")
-            if (target / "cpu.max").read_text(encoding="ascii").split() != [
-                str(record.policy.cpu_millicores * 100),
-                "100000",
-            ]:
-                raise OSError("CPU limit readback mismatch")
+            (target / "memory.max").write_text(str(record.policy.memory_bytes), encoding="ascii")
+            verify_cgroup_v2_limits(
+                target,
+                cpu_millicores=record.policy.cpu_millicores,
+                memory_bytes=record.policy.memory_bytes,
+                pid_limit=record.policy.pid_limit,
+            )
             record.cgroup_path = target
+            record.container_id = f"aik-{record.identity.execution_id.hex}"
+            record.measurement_started_monotonic = self._monotonic()
+            record.cgroup_start_sample = collect_cgroup_v2_sample(
+                target,
+                execution_id=record.identity.execution_id,
+                container_id=record.container_id,
+                sampled_monotonic=record.measurement_started_monotonic,
+                cpu_millicores=record.policy.cpu_millicores,
+                memory_bytes=record.policy.memory_bytes,
+                pid_limit=record.policy.pid_limit,
+            )
+        except CgroupEvidenceError as exc:
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+            raise KataRuntimeError(exc.code) from None
         except OSError as exc:
             # cgroupfs is not a normal filesystem: remove only the empty cgroup
             # directory, and retain a failure if the kernel says it is busy.
@@ -1003,7 +1030,77 @@ class KataSandboxAdapter:
 
     def collect_evidence(self, execution_id: uuid.UUID) -> SandboxEvidence:
         record = self._record(execution_id)
-        return SandboxEvidence(
+        if record.resource_evidence is not None:
+            return record.resource_evidence
+
+        observed_monotonic = self._monotonic()
+        sample: CgroupV2Sample | None = None
+        measurement_error: str | None = None
+        try:
+            if record.cgroup_path is None or record.container_id is None:
+                raise CgroupEvidenceError("CGROUP_PATH_UNAVAILABLE")
+            sample = collect_cgroup_v2_sample(
+                record.cgroup_path,
+                execution_id=record.identity.execution_id,
+                container_id=record.container_id,
+                sampled_monotonic=observed_monotonic,
+                cpu_millicores=record.policy.cpu_millicores,
+                memory_bytes=record.policy.memory_bytes,
+                pid_limit=record.policy.pid_limit,
+            )
+        except CgroupEvidenceError as exc:
+            measurement_error = exc.code
+
+        baseline = record.cgroup_start_sample
+        if sample is not None and (
+            baseline is None
+            or sample.sampled_monotonic <= baseline.sampled_monotonic
+            or sample.cpu_usage_usec < baseline.cpu_usage_usec
+        ):
+            # A sample with a reversed/non-advancing interval or a regressed
+            # counter cannot be attributed to this execution interval. Discard
+            # the whole sample rather than retaining plausible current gauges.
+            sample = None
+            measurement_error = "CGROUP_METRIC_INTERVAL_INVALID"
+
+        cpu_millicores: int | None = None
+        memory_bytes: int | None = None
+        process_count: int | None = None
+        resource_usage: dict[str, int] = {}
+        if sample is not None and baseline is not None:
+            elapsed_usec = int(
+                (sample.sampled_monotonic - baseline.sampled_monotonic) * 1_000_000
+            )
+            cpu_delta = sample.cpu_usage_usec - baseline.cpu_usage_usec
+            if elapsed_usec <= 0 or cpu_delta < 0:
+                measurement_error = "CGROUP_METRIC_INTERVAL_INVALID"
+            else:
+                cpu_millicores = (cpu_delta * 1000) // elapsed_usec
+                resource_usage["cpu_usec"] = cpu_delta
+                resource_usage["cpu_millicores"] = cpu_millicores
+            memory_bytes = sample.memory_current_bytes
+            process_count = sample.pids_current
+            resource_usage["memory_current_bytes"] = sample.memory_current_bytes
+            resource_usage["pids_current"] = sample.pids_current
+            if sample.memory_peak_bytes is not None:
+                resource_usage["memory_peak_bytes"] = sample.memory_peak_bytes
+            if sample.pids_peak is not None:
+                resource_usage["pids_peak"] = sample.pids_peak
+
+        values = {
+            "process_count": process_count,
+            "memory_bytes": memory_bytes,
+            "filesystem_bytes": None,
+            "filesystem_inodes": None,
+            "file_descriptors": None,
+            "cpu_millicores": cpu_millicores,
+            "memory_peak_bytes": (
+                sample.memory_peak_bytes if sample is not None else None
+            ),
+            "pids_peak": sample.pids_peak if sample is not None else None,
+        }
+        unavailable = tuple(name for name, value in values.items() if value is None)
+        record.resource_evidence = SandboxEvidence(
             execution_id=execution_id,
             artifact_digest=record.identity.artifact_digest,
             submission_version_id=record.identity.submission_version_id,
@@ -1011,15 +1108,28 @@ class KataSandboxAdapter:
             failure_class=record.failure,
             stdout_bytes=record.stdout_total,
             stderr_bytes=record.stderr_total,
-            process_count=None,
-            memory_bytes=None,
+            process_count=process_count,
+            memory_bytes=memory_bytes,
             filesystem_bytes=None,
             filesystem_inodes=None,
             file_descriptors=None,
-            cpu_millicores=None,
+            cpu_millicores=cpu_millicores,
             started_monotonic=record.started_mono,
-            observed_monotonic=self._monotonic(),
+            observed_monotonic=observed_monotonic,
             cleanup=record.cleanup,
+            resource_usage=resource_usage,
+            unavailable_measurements=unavailable,
+            measurement_error=measurement_error,
+            measurement_source="cgroup-v2" if sample is not None else None,
+            measurement_scope="execution-cgroup-host-tasks" if sample is not None else None,
+            # A failed read has no attributable observation. Report the stable
+            # error and missing fields without presenting a container identity
+            # as if a valid cgroup sample had been collected.
+            measurement_container_id=record.container_id if sample is not None else None,
+            measurement_started_monotonic=(
+                record.measurement_started_monotonic if sample is not None else None
+            ),
+            measurement_ended_monotonic=sample.sampled_monotonic if sample is not None else None,
             subject_kind=record.identity.subject_kind,
             house_ai_id=record.identity.house_ai_id,
             house_ai_version=record.identity.house_ai_version,
@@ -1029,13 +1139,20 @@ class KataSandboxAdapter:
             fencing_token=record.identity.fencing_token,
             policy_digest=record.identity.policy_digest,
             runtime_identity=f"{self._config.runtime}/{self._config.runtime_version};containerd/{self._config.ctr_version}",
-            container_id=f"aik-{execution_id.hex}",
+            container_id=record.container_id,
             started_at=record.started_at,
             ended_at=record.ended_at,
             termination_reason=record.termination_reason,
             stdout_evidence=bytes(record.stdout_evidence),
             stderr_evidence=bytes(record.stderr_evidence),
         )
+        return record.resource_evidence
+
+    def verify_resource_evidence(self, execution_id: uuid.UUID) -> None:
+        """Fail closed if required workload measurements are absent or invalid."""
+        evidence = self.collect_evidence(execution_id)
+        if evidence.measurement_error or evidence.unavailable_measurements:
+            raise KataRuntimeError("REQUIRED_RESOURCE_EVIDENCE_UNAVAILABLE")
 
     def verify_cleanup(self, execution_id: uuid.UUID) -> CleanupResult:
         record = self._record(execution_id)
@@ -1045,6 +1162,8 @@ class KataSandboxAdapter:
             ExecutionState.CLEANUP_UNKNOWN,
         }:
             raise InvalidTransitionError("CLEANUP_REQUIRES_TERMINAL_STATE")
+        if record.resource_evidence is None:
+            self.collect_evidence(execution_id)
         container_id = f"aik-{execution_id.hex}"
         try:
             self._kill_task(record)

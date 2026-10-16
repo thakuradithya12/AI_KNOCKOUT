@@ -74,10 +74,12 @@ class MatchCoordinator:
             MatchSideColor.WHITE, MatchSideColor.BLACK
         }:
             raise CoordinatorError("MATCH_CONTROLLER_NOT_READY")
-        if {side.kind for side in controller.sides.values()} != {
-            MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI
-        }:
-            raise CoordinatorError("DEVELOPMENT_MATCH_REQUIRED")
+        if {side.kind for side in controller.sides.values()} not in (
+            {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI},
+            {MatchSideKind.PARTICIPANT},
+            {MatchSideKind.HOUSE_AI},
+        ):
+            raise CoordinatorError("UNSUPPORTED_MATCH_SIDES")
         if controller.match_id in self._matches:
             raise CoordinatorError("MATCH_CONTROLLER_ALREADY_REGISTERED")
         self._matches[controller.match_id] = _MatchSlot(
@@ -93,17 +95,18 @@ class MatchCoordinator:
             controller = slot.controller
             if controller.state != MatchState.RUNNING or controller.result or controller.failure:
                 raise CoordinatorError("MATCH_TERMINAL")
+            if self._deadline_expired(controller):
+                decision = controller.expire_move_deadline()
+                slot.pending = None
+                await self._persist_or_fail(slot)
+                if decision is not None:
+                    return None
+
             if slot.pending is not None:
                 pending = slot.pending
                 if self._same_authority(pending, authority):
                     return pending
                 return None
-
-            if self._deadline_expired(controller):
-                decision = controller.expire_move_deadline()
-                await self._persist_or_fail(slot)
-                if decision is not None:
-                    return None
 
             side = authority.side
             request_id = str(uuid.uuid4())

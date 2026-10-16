@@ -28,7 +28,6 @@ class ParticipantRegisterRequest(BaseModel):
     )
     team_name: str | None = Field(
         default=None,
-        min_length=1,
         max_length=100,
         description="Optional team designation.",
         examples=["Team Alpha"],
@@ -41,8 +40,27 @@ class ParticipantRegisterRequest(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("Name cannot be empty or whitespace only.")
+        if len(v) < 2:
+            raise ValueError("Name must be at least 2 characters.")
+        if len(v) > 100:
+            raise ValueError("Name exceeds maximum length of 100 characters.")
         if re.search(r"[\x00-\x1f<>]", v):
             raise ValueError("Name contains prohibited characters.")
+        return v
+
+    @field_validator("team_name", mode="before")
+    @classmethod
+    def validate_team_name(cls, v: str | None) -> str | None:
+        """Enforce clean optional team name."""
+        if v is None:
+            return None
+        v = str(v).strip()
+        if not v:
+            return None
+        if re.search(r"[\x00-\x1f<>]", v):
+            raise ValueError("Team name contains prohibited characters.")
+        if len(v) > 100:
+            raise ValueError("Team name exceeds maximum length of 100 characters.")
         return v
 
     @field_validator("email")

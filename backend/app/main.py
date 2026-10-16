@@ -21,9 +21,9 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.health import router as health_router
@@ -91,6 +91,48 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         raise RuntimeError(f"Redis verification failed: {redis_health}")
     logger.info("Redis connection verified")
 
+    # Reconcile orphaned matches: any match left in RUNNING or STARTING from a
+    # previous process cannot make progress because the in-memory coordinator
+    # state (MatchCoordinator._matches) was lost on restart.  Transition them
+    # to ABORTED so workers stop waiting and the leaderboard stays consistent.
+    try:
+        from datetime import datetime, timezone
+        from sqlalchemy import update as sa_update
+        from app.db.session import _session_factory  # already initialized above
+        from app.models.match import Match, MatchState
+
+        if _session_factory is not None:
+            async with _session_factory() as session:
+                stmt = (
+                    sa_update(Match)
+                    .where(Match.state.in_([MatchState.RUNNING, MatchState.STARTING]))
+                    .values(
+                        state=MatchState.ABORTED,
+                        failure_reason="CONTROLLER_RESTART",
+                        completed_at=datetime.now(timezone.utc),
+                    )
+                    .returning(Match.id)
+                )
+                result = await session.execute(stmt)
+                aborted_ids = result.scalars().all()
+                await session.commit()
+            if aborted_ids:
+                logger.warning(
+                    f"Reconciled {len(aborted_ids)} orphaned match(es) to ABORTED on startup",
+                    extra={"aborted_match_ids": [str(m) for m in aborted_ids]},
+                )
+            else:
+                logger.info("No orphaned matches found on startup")
+        else:
+            logger.warning("Session factory not ready; skipping orphan match reconciliation")
+    except Exception as reconcile_exc:
+        # Non-fatal: log and continue startup. Orphaned matches are a correctness
+        # issue, not a safety one — the server can still operate.
+        logger.error(
+            f"Startup match reconciliation failed (non-fatal): {reconcile_exc}",
+            exc_info=True,
+        )
+
     logger.info("Application startup complete")
 
     yield
@@ -150,6 +192,13 @@ def create_app() -> FastAPI:
     @app.get("/portal", include_in_schema=False)
     async def participant_portal_alias() -> FileResponse:
         return FileResponse(static_dir / "index.html")
+
+    @app.get("/callback", include_in_schema=False)
+    async def oidc_callback_root_alias(request: Request) -> RedirectResponse:
+        """Forward browser OIDC redirect at root /callback to canonical API callback."""
+        query = request.url.query
+        target = f"/api/v1/auth/organizer/callback?{query}" if query else "/api/v1/auth/organizer/callback"
+        return RedirectResponse(url=target, status_code=307)
 
     return app
 

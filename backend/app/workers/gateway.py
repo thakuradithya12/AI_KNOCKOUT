@@ -15,10 +15,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
+from app.models.event import TournamentPairingRecord
 from app.models.match import (
     HouseAIMatchSideBinding,
     Match,
     MatchExecutionBinding,
+    MatchPurpose,
     MatchSide,
     MatchSideKind,
     ParticipantMatchSideBinding,
@@ -210,13 +212,14 @@ async def claim_worker_job(
     job = await claim_job(db, worker=worker)
     if job is None:
         return None
+    match = await db.get(Match, job.match_id) if job.match_id else None
     return JobOut(
         execution_id=job.execution_id,
         execution_mode=job.execution_mode,
         execution_kind=job.execution_kind.value,
         match_id=job.match_id,
         match_side_id=await _job_side_id(db, job),
-        match_purpose=(await db.get(Match, job.match_id)).purpose.value if job.match_id else None,
+        match_purpose=match.purpose.value if match is not None else None,
         worker_id=worker.worker_id,
         participant_id=job.participant_id,
         submission_id=job.submission_id,
@@ -425,8 +428,24 @@ async def _control_authority(db, *, worker, execution_id, lease_id, fence, attem
     if attempt != existing_attempt:
         raise WorkerProtocolError(409, "EXECUTION_ATTEMPT_MISMATCH")
     match = await db.get(Match, job.match_id)
-    if match is None or match.purpose.value != "DEVELOPMENT":
-        raise WorkerProtocolError(409, "DEVELOPMENT_MATCH_REQUIRED")
+    if match is None:
+        raise WorkerProtocolError(404, "MATCH_NOT_FOUND")
+    job_purpose = (job.initial_state or {}).get("purpose")
+    match_purpose_val = match.purpose.value if hasattr(match.purpose, "value") else str(match.purpose)
+    if job_purpose is not None and job_purpose != match_purpose_val:
+        raise WorkerProtocolError(409, "MATCH_PURPOSE_MISMATCH")
+    supported_purposes = {MatchPurpose.DEVELOPMENT, MatchPurpose.OFFICIAL, MatchPurpose.PEER_TEST}
+    if match.purpose not in supported_purposes and match.purpose not in {p.value for p in supported_purposes}:
+        raise WorkerProtocolError(409, "UNSUPPORTED_MATCH_PURPOSE")
+    if match.purpose in {MatchPurpose.OFFICIAL, MatchPurpose.OFFICIAL.value}:
+        pairing = await db.scalar(
+            select(TournamentPairingRecord).where(
+                (TournamentPairingRecord.game1_match_id == match.id)
+                | (TournamentPairingRecord.game2_match_id == match.id)
+            )
+        )
+        if pairing is None:
+            raise WorkerProtocolError(403, "UNAUTHORIZED_OFFICIAL_MATCH")
     result = {
         "match_id": str(match.id),
         "side_id": str(side.id),

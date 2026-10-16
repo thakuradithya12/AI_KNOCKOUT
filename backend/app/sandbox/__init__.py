@@ -11,6 +11,7 @@ from app.sandbox.contract import (
     SandboxSupervisor,
 )
 from app.sandbox.kata import KataRuntimeConfig, KataSandboxAdapter
+from app.sandbox.modal import ModalRuntimeConfig, ModalRuntimeError, ModalSandboxAdapter
 
 __all__ = [
     "AIKMessage",
@@ -21,6 +22,10 @@ __all__ = [
     "KataRuntimeConfig",
     "KataSandboxAdapter",
     "LeaseFenceAuthority",
+    "ModalRuntimeConfig",
+    "ModalRuntimeError",
+    "ModalSandboxAdapter",
     "SandboxPolicy",
     "SandboxSupervisor",
 ]
+

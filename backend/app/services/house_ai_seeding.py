@@ -34,12 +34,21 @@ from app.services.house_ai_configuration import (
     register_and_freeze_house_ai_version,
 )
 from app.services.submission_validation import validate_submission_package
-from tests.fixtures.trusted_engine.builder import build_trusted_engine_archive
+from app.services.trusted_engine_builder import (
+    AIK_HOUSE_001_ID,
+    AIK_HOUSE_001_VERSION,
+    build_aik_house_001_engine_archive,
+    build_maximum_difficulty_engine_archive,
+    build_trusted_engine_archive,
+)
 
 DEFAULT_BASELINE_HOUSE_AI_ID = "house-ai-benchmark-baseline"
 DEFAULT_BASELINE_VERSION = 1
 DEFAULT_BASELINE_ACTOR = "system-baseline-seeder"
 DEFAULT_BASELINE_REASON = "DEVELOPMENT_BASELINE_SEED"
+
+MAXIMUM_DIFFICULTY_HOUSE_AI_ID = "house-ai-maximum-difficulty"
+MAXIMUM_DIFFICULTY_VERSION = 1
 
 
 def get_default_development_policy_document() -> dict:
@@ -172,12 +181,162 @@ async def seed_deterministic_house_ai_baseline(
     return version_row, selection_row
 
 
+async def seed_deterministic_house_ai_maximum_difficulty(
+    db: AsyncSession,
+    *,
+    house_ai_id: str = MAXIMUM_DIFFICULTY_HOUSE_AI_ID,
+    version: int = MAXIMUM_DIFFICULTY_VERSION,
+    archive_bytes: bytes | None = None,
+    actor_id: str = DEFAULT_BASELINE_ACTOR,
+    reason_code: str = "MAXIMUM_DIFFICULTY_SEED",
+    auto_activate: bool = True,
+) -> tuple[HouseAIVersion, Optional[EventHouseAISelection]]:
+    """Register and optionally activate the Maximum Difficulty House AI opponent."""
+    if archive_bytes is None:
+        archive_bytes = build_maximum_difficulty_engine_archive()
+
+    validated = validate_submission_package(archive_bytes)
+    digest = hashlib.sha256(archive_bytes).hexdigest()
+    policy = await ensure_development_policy(db)
+
+    existing_version = await db.scalar(
+        select(HouseAIVersion).where(
+            HouseAIVersion.house_ai_id == house_ai_id,
+            HouseAIVersion.version == version,
+        )
+    )
+
+    if existing_version is None:
+        version_row = await register_and_freeze_house_ai_version(
+            db,
+            house_ai_id=house_ai_id,
+            version=version,
+            archive_bytes=archive_bytes,
+            protocol_version=validated.manifest["protocol_version"],
+            runtime_profile=validated.manifest["runtime"],
+            runtime_identity_sha256=digest,
+            rules_version=policy.policy_document.get("rules_version", "standard-chess/python-chess-1.11.2"),
+            policy_version=policy.version,
+            policy_digest=policy.policy_digest,
+            actor_id=actor_id,
+            reason_code=reason_code,
+        )
+    else:
+        version_row = existing_version
+
+    selection_row = None
+    if auto_activate:
+        active_selection = await db.scalar(
+            select(EventHouseAISelection).where(
+                EventHouseAISelection.deactivated_at.is_(None)
+            )
+        )
+        if (
+            active_selection is None
+            or active_selection.house_ai_id != house_ai_id
+            or active_selection.house_ai_version != version
+        ):
+            selection_row = await activate_house_ai_version(
+                db,
+                house_ai_id=house_ai_id,
+                version=version,
+                actor_id=actor_id,
+                reason_code=f"{reason_code}_ACTIVE",
+            )
+        else:
+            selection_row = active_selection
+
+    return version_row, selection_row
+
+
+async def seed_deterministic_house_ai_unified(
+    db: AsyncSession,
+    *,
+    house_ai_id: str = AIK_HOUSE_001_ID,
+    version: int = AIK_HOUSE_001_VERSION,
+    archive_bytes: bytes | None = None,
+    actor_id: str = DEFAULT_BASELINE_ACTOR,
+    reason_code: str = "AIK_HOUSE_001_SEED",
+    auto_activate: bool = True,
+) -> tuple[HouseAIVersion, Optional[EventHouseAISelection]]:
+    """Register and activate the Unified House AI opponent (AIK-HOUSE-001 v1.0.0)."""
+    if archive_bytes is None:
+        archive_bytes = build_aik_house_001_engine_archive()
+
+    validated = validate_submission_package(archive_bytes)
+    digest = hashlib.sha256(archive_bytes).hexdigest()
+    policy = await ensure_development_policy(db)
+
+    existing_version = await db.scalar(
+        select(HouseAIVersion).where(
+            HouseAIVersion.house_ai_id == house_ai_id,
+            HouseAIVersion.version == version,
+        )
+    )
+
+    if existing_version is None:
+        version_row = await register_and_freeze_house_ai_version(
+            db,
+            house_ai_id=house_ai_id,
+            version=version,
+            archive_bytes=archive_bytes,
+            protocol_version=validated.manifest["protocol_version"],
+            runtime_profile=validated.manifest["runtime"],
+            runtime_identity_sha256=digest,
+            rules_version=policy.policy_document.get("rules_version", "standard-chess/python-chess-1.11.2"),
+            policy_version=policy.version,
+            policy_digest=policy.policy_digest,
+            actor_id=actor_id,
+            reason_code=reason_code,
+        )
+    else:
+        version_row = existing_version
+
+    selection_row = None
+    if auto_activate:
+        active_selection = await db.scalar(
+            select(EventHouseAISelection).where(
+                EventHouseAISelection.deactivated_at.is_(None)
+            )
+        )
+        if (
+            active_selection is None
+            or active_selection.house_ai_id != house_ai_id
+            or active_selection.house_ai_version != version
+        ):
+            selection_row = await activate_house_ai_version(
+                db,
+                house_ai_id=house_ai_id,
+                version=version,
+                actor_id=actor_id,
+                reason_code=f"{reason_code}_ACTIVE",
+            )
+        else:
+            selection_row = active_selection
+
+    return version_row, selection_row
+
+
+async def seed_all_house_ais(db: AsyncSession) -> dict:
+    """Seed baseline, maximum-difficulty, and unified House AIs, activating AIK-HOUSE-001."""
+    v_base, _ = await seed_deterministic_house_ai_baseline(db, auto_activate=False)
+    v_max, _ = await seed_deterministic_house_ai_maximum_difficulty(db, auto_activate=False)
+    v_unified, sel_unified = await seed_deterministic_house_ai_unified(db, auto_activate=True)
+    return {
+        "baseline": v_base,
+        "maximum_difficulty": v_max,
+        "unified": v_unified,
+        "active_selection": sel_unified,
+    }
+
+
 async def _cli_main() -> None:
     parser = argparse.ArgumentParser(description="Deterministic House AI Baseline Seeder (DEF-07)")
     parser.add_argument("--db-url", type=str, default=None, help="Target PostgreSQL database URL (defaults to env)")
     parser.add_argument("--house-ai-id", type=str, default=DEFAULT_BASELINE_HOUSE_AI_ID, help="House AI ID")
     parser.add_argument("--version", type=int, default=DEFAULT_BASELINE_VERSION, help="House AI version")
     parser.add_argument("--no-activate", action="store_true", help="Do not activate the baseline selection")
+    parser.add_argument("--all", action="store_true", help="Seed both baseline and maximum-difficulty House AIs")
     args = parser.parse_args()
 
     import os
@@ -192,16 +351,22 @@ async def _cli_main() -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     async with session_factory() as session:
-        version_row, selection_row = await seed_deterministic_house_ai_baseline(
-            session,
-            house_ai_id=args.house_ai_id,
-            version=args.version,
-            auto_activate=not args.no_activate,
-        )
-        await session.commit()
-        print(f"SUCCESS: Seeded House AI {version_row.house_ai_id} v{version_row.version} (digest: {version_row.artifact_sha256[:16]}...)")
-        if selection_row:
-            print(f"ACTIVE SELECTION: {selection_row.house_ai_id} v{selection_row.house_ai_version} (selection_id: {selection_row.selection_id})")
+        if args.all:
+            res = await seed_all_house_ais(session)
+            await session.commit()
+            print(f"SUCCESS: Seeded all House AIs. Baseline: {res['baseline'].house_ai_id} v{res['baseline'].version}, Max: {res['maximum_difficulty'].house_ai_id} v{res['maximum_difficulty'].version}")
+            print(f"ACTIVE SELECTION: {res['active_selection'].house_ai_id} v{res['active_selection'].house_ai_version}")
+        else:
+            version_row, selection_row = await seed_deterministic_house_ai_baseline(
+                session,
+                house_ai_id=args.house_ai_id,
+                version=args.version,
+                auto_activate=not args.no_activate,
+            )
+            await session.commit()
+            print(f"SUCCESS: Seeded House AI {version_row.house_ai_id} v{version_row.version} (digest: {version_row.artifact_sha256[:16]}...)")
+            if selection_row:
+                print(f"ACTIVE SELECTION: {selection_row.house_ai_id} v{selection_row.house_ai_version} (selection_id: {selection_row.selection_id})")
 
     await engine.dispose()
 

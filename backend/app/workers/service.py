@@ -21,6 +21,7 @@ from app.models.match import (
     Match,
     MatchPurpose,
     MatchSide,
+    MatchSideColor,
     MatchSideKind,
     MatchState,
     ParticipantMatchSideBinding,
@@ -406,9 +407,9 @@ async def create_execution_job(
     )
     if not participant_subject and not house_subject:
         raise WorkerProtocolError(422, "EXECUTION_SUBJECT_INVALID")
-    if execution_mode not in {"MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION"}:
+    if execution_mode not in {"MOCK_PROTOCOL_ONLY", "KATA_AI_EXECUTION", "MODAL_AI_EXECUTION"}:
         raise WorkerProtocolError(422, "EXECUTION_MODE_INVALID")
-    if execution_mode == "KATA_AI_EXECUTION" and match_id is None:
+    if execution_mode in {"KATA_AI_EXECUTION", "MODAL_AI_EXECUTION"} and match_id is None:
         raise WorkerProtocolError(422, "KATA_MATCH_BINDING_REQUIRED")
     if house_subject and match_id is None:
         raise WorkerProtocolError(422, "HOUSE_AI_MATCH_BINDING_REQUIRED")
@@ -416,7 +417,7 @@ async def create_execution_job(
     house_identity = None
     if participant_subject:
         version = await db.get(SubmissionVersion, submission_version_id)
-        if version is None or version.state != ArtifactState.ELIGIBLE:
+        if version is None or version.state not in (ArtifactState.APPROVED, ArtifactState.ELIGIBLE):
             raise WorkerProtocolError(409, "ARTIFACT_NOT_ELIGIBLE")
         execution_kind = ExecutionKind.PARTICIPANT
         artifact_digest = version.artifact_sha256
@@ -617,55 +618,13 @@ async def dispatch_development_match_jobs(
         )
     ).scalars().all()
     by_kind = {side.kind: side for side in sides}
-    if len(sides) != 2 or set(by_kind) != {MatchSideKind.PARTICIPANT, MatchSideKind.HOUSE_AI}:
+    is_participant_match = any(side.kind == MatchSideKind.PARTICIPANT for side in sides)
+    is_house_duel = all(side.kind == MatchSideKind.HOUSE_AI for side in sides)
+    if len(sides) != 2 or not (is_participant_match or is_house_duel):
         raise WorkerProtocolError(409, "MATCH_SIDE_COMPOSITION_INVALID")
-    participant_side = by_kind[MatchSideKind.PARTICIPANT]
-    house_side = by_kind[MatchSideKind.HOUSE_AI]
-    participant_binding = participant_side.participant_binding
-    house_binding = house_side.house_ai_binding
-    if participant_binding is None or house_binding is None:
-        raise WorkerProtocolError(409, "MATCH_SIDE_IDENTITY_MISSING")
 
-    participant_version = await db.scalar(
-        select(SubmissionVersion)
-        .where(SubmissionVersion.id == participant_binding.submission_version_id)
-        .with_for_update()
-    )
-    if (
-        participant_version is None
-        or participant_version.state != ArtifactState.ELIGIBLE
-        or participant_version.artifact_sha256 != participant_binding.artifact_sha256
-        or participant_version.participant_id != participant_binding.participant_id
-        or participant_version.submission_id != participant_binding.submission_id
-    ):
-        raise WorkerProtocolError(409, "PARTICIPANT_MATCH_SUBJECT_INVALID")
-    house_version = await db.get(
-        HouseAIVersion, (house_binding.house_ai_id, house_binding.house_ai_version)
-    )
-    if (
-        house_version is None
-        or house_version.frozen_at is None
-        or house_version.artifact_sha256 != house_binding.artifact_sha256
-    ):
-        raise WorkerProtocolError(409, "HOUSE_AI_MATCH_SUBJECT_INVALID")
-    if any(
-        side.protocol_version != match.protocol_version
-        or side.runtime_profile != match.runtime_profile
-        for side in sides
-    ):
-        raise WorkerProtocolError(409, "MATCH_RUNTIME_IDENTITY_INVALID")
     policy = await db.get(DevelopmentMatchPolicy, (match.policy_id, match.policy_version))
-    if (
-        policy is None
-        or policy.policy_digest != match.policy_digest
-        or participant_version.protocol_version != match.protocol_version
-        or participant_version.runtime_profile != match.runtime_profile
-        or house_version.protocol_version != match.protocol_version
-        or house_version.runtime_profile != match.runtime_profile
-        or house_version.rules_version != match.rules_version
-        or house_version.policy_version != match.policy_version
-        or house_version.policy_digest != match.policy_digest
-    ):
+    if policy is None or policy.policy_digest != match.policy_digest:
         raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_MISMATCH")
     canonical_policy = json.dumps(
         policy.policy_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -676,6 +635,7 @@ async def dispatch_development_match_jobs(
         resources = ResourcePolicy.model_validate(policy.policy_document["resources"])
     except (KeyError, TypeError, ValueError) as exc:
         raise WorkerProtocolError(409, "DEVELOPMENT_RESOURCE_POLICY_INVALID") from exc
+
     initial_state = {
         "match_id": str(match.id),
         "purpose": match.purpose.value,
@@ -708,6 +668,122 @@ async def dispatch_development_match_jobs(
             .with_for_update()
         )
     ).scalars().all()
+
+    if is_house_duel:
+        w_side = next((s for s in sides if s.color == MatchSideColor.WHITE), None)
+        b_side = next((s for s in sides if s.color == MatchSideColor.BLACK), None)
+        if (
+            w_side is None
+            or b_side is None
+            or w_side.house_ai_binding is None
+            or b_side.house_ai_binding is None
+        ):
+            raise WorkerProtocolError(409, "MATCH_SIDE_IDENTITY_MISSING")
+        if w_side.house_ai_binding.house_ai_id == b_side.house_ai_binding.house_ai_id:
+            raise WorkerProtocolError(409, "DUPLICATE_HOUSE_AI_SIDE")
+
+        for side in (w_side, b_side):
+            h_binding = side.house_ai_binding
+            h_version = await db.get(
+                HouseAIVersion, (h_binding.house_ai_id, h_binding.house_ai_version)
+            )
+            if (
+                h_version is None
+                or h_version.frozen_at is None
+                or h_version.artifact_sha256 != h_binding.artifact_sha256
+            ):
+                raise WorkerProtocolError(409, "HOUSE_AI_MATCH_SUBJECT_INVALID")
+            if (
+                side.protocol_version != match.protocol_version
+                or side.runtime_profile != match.runtime_profile
+                or h_version.protocol_version != match.protocol_version
+                or h_version.runtime_profile != match.runtime_profile
+                or h_version.rules_version != match.rules_version
+                or h_version.policy_version != match.policy_version
+                or h_version.policy_digest != match.policy_digest
+            ):
+                raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_MISMATCH")
+
+        by_house_jobs = {job.house_ai_id: job for job in current if job.house_ai_id}
+
+        async def ensure_house_job(side: MatchSide) -> WorkerExecutionJob:
+            binding = side.house_ai_binding
+            existing = by_house_jobs.get(binding.house_ai_id)
+            if existing is not None:
+                if (
+                    existing.artifact_sha256 != binding.artifact_sha256
+                    or existing.protocol_version != side.protocol_version
+                    or existing.runtime_profile != side.runtime_profile
+                    or existing.initial_state != initial_state
+                    or existing.resource_policy != resources.model_dump(mode="json")
+                ):
+                    raise WorkerProtocolError(409, "MATCH_CURRENT_JOB_MISMATCH")
+                return existing
+            return await create_execution_job(
+                db,
+                house_ai_id=binding.house_ai_id,
+                house_ai_version=binding.house_ai_version,
+                initial_state=initial_state,
+                resource_policy=resources,
+                execution_expires_at=expires,
+                match_id=match.id,
+                execution_mode="KATA_AI_EXECUTION",
+                commit=False,
+            )
+
+        w_job = await ensure_house_job(w_side)
+        b_job = await ensure_house_job(b_side)
+        await db.commit()
+        await db.refresh(w_job)
+        await db.refresh(b_job)
+        return w_job, b_job
+
+    participant_side = by_kind[MatchSideKind.PARTICIPANT]
+    house_side = by_kind[MatchSideKind.HOUSE_AI]
+    participant_binding = participant_side.participant_binding
+    house_binding = house_side.house_ai_binding
+    if participant_binding is None or house_binding is None:
+        raise WorkerProtocolError(409, "MATCH_SIDE_IDENTITY_MISSING")
+
+    participant_version = await db.scalar(
+        select(SubmissionVersion)
+        .where(SubmissionVersion.id == participant_binding.submission_version_id)
+        .with_for_update()
+    )
+    if (
+        participant_version is None
+        or participant_version.state not in (ArtifactState.APPROVED, ArtifactState.ELIGIBLE)
+        or participant_version.artifact_sha256 != participant_binding.artifact_sha256
+        or participant_version.participant_id != participant_binding.participant_id
+        or participant_version.submission_id != participant_binding.submission_id
+    ):
+        raise WorkerProtocolError(409, "PARTICIPANT_MATCH_SUBJECT_INVALID")
+    house_version = await db.get(
+        HouseAIVersion, (house_binding.house_ai_id, house_binding.house_ai_version)
+    )
+    if (
+        house_version is None
+        or house_version.frozen_at is None
+        or house_version.artifact_sha256 != house_binding.artifact_sha256
+    ):
+        raise WorkerProtocolError(409, "HOUSE_AI_MATCH_SUBJECT_INVALID")
+    if any(
+        side.protocol_version != match.protocol_version
+        or side.runtime_profile != match.runtime_profile
+        for side in sides
+    ):
+        raise WorkerProtocolError(409, "MATCH_RUNTIME_IDENTITY_INVALID")
+    if (
+        participant_version.protocol_version != match.protocol_version
+        or participant_version.runtime_profile != match.runtime_profile
+        or house_version.protocol_version != match.protocol_version
+        or house_version.runtime_profile != match.runtime_profile
+        or house_version.rules_version != match.rules_version
+        or house_version.policy_version != match.policy_version
+        or house_version.policy_digest != match.policy_digest
+    ):
+        raise WorkerProtocolError(409, "DEVELOPMENT_POLICY_MISMATCH")
+
     by_kind_jobs = {job.execution_kind: job for job in current}
     if len(current) != len(by_kind_jobs) or set(by_kind_jobs) - {
         ExecutionKind.PARTICIPANT, ExecutionKind.HOUSE_AI
@@ -757,6 +833,160 @@ async def dispatch_development_match_jobs(
     await db.refresh(participant_job)
     await db.refresh(house_job)
     return participant_job, house_job
+
+
+async def dispatch_participant_match_jobs(
+    db: AsyncSession,
+    *,
+    match_id: uuid.UUID,
+    execution_mode: str = "MODAL_AI_EXECUTION",
+) -> tuple[WorkerExecutionJob, WorkerExecutionJob]:
+    """Atomically create participant execution jobs for an official or peer test match."""
+    match = (
+        await db.execute(select(Match).where(Match.id == match_id).with_for_update())
+    ).scalar_one_or_none()
+    if match is None:
+        raise WorkerProtocolError(404, "MATCH_NOT_FOUND")
+    if match.purpose not in {MatchPurpose.OFFICIAL, MatchPurpose.PEER_TEST}:
+        raise WorkerProtocolError(409, "PARTICIPANT_MATCH_REQUIRED")
+    if match.state != MatchState.QUEUED:
+        raise WorkerProtocolError(409, "MATCH_NOT_QUEUED")
+
+    sides = (
+        await db.execute(
+            select(MatchSide)
+            .where(MatchSide.match_id == match.id)
+            .order_by(MatchSide.color)
+            .with_for_update(of=MatchSide)
+        )
+    ).scalars().all()
+    if len(sides) != 2 or any(side.kind != MatchSideKind.PARTICIPANT for side in sides):
+        raise WorkerProtocolError(409, "MATCH_SIDE_COMPOSITION_INVALID")
+
+    white_side = next(s for s in sides if s.color == MatchSideColor.WHITE)
+    black_side = next(s for s in sides if s.color == MatchSideColor.BLACK)
+    white_binding = white_side.participant_binding
+    black_binding = black_side.participant_binding
+    if white_binding is None or black_binding is None:
+        raise WorkerProtocolError(409, "MATCH_SIDE_IDENTITY_MISSING")
+
+    white_version = await db.scalar(
+        select(SubmissionVersion)
+        .where(SubmissionVersion.id == white_binding.submission_version_id)
+        .with_for_update()
+    )
+    black_version = await db.scalar(
+        select(SubmissionVersion)
+        .where(SubmissionVersion.id == black_binding.submission_version_id)
+        .with_for_update()
+    )
+    for v, b in [(white_version, white_binding), (black_version, black_binding)]:
+        if (
+            v is None
+            or v.state != ArtifactState.ELIGIBLE
+            or v.artifact_sha256 != b.artifact_sha256
+            or v.participant_id != b.participant_id
+            or v.submission_id != b.submission_id
+        ):
+            raise WorkerProtocolError(409, "PARTICIPANT_MATCH_SUBJECT_INVALID")
+
+    if any(
+        side.protocol_version != match.protocol_version
+        or side.runtime_profile != match.runtime_profile
+        for side in sides
+    ):
+        raise WorkerProtocolError(409, "MATCH_RUNTIME_IDENTITY_INVALID")
+
+    resources = ResourcePolicy(
+        cpu_millicores=1000,
+        memory_bytes=268435456,
+        pid_limit=16,
+        tmpfs_bytes=33554432,
+        inode_limit=128,
+        nofile_limit=64,
+        stdout_line_bytes=65536,
+        stdout_total_bytes=1048576,
+        stderr_total_bytes=262144,
+        startup_timeout_ms=5000,
+        ready_timeout_ms=2000,
+        move_timeout_ms=match.move_timeout_ms,
+        process_lifetime_ms=max(60_000, match.initial_clock_ms * 2),
+        concurrency_per_worker=1,
+        network_mode="DENY_ALL",
+    )
+
+    initial_state = {
+        "match_id": str(match.id),
+        "purpose": match.purpose.value,
+        "match_seed": match.match_seed,
+        "initial_fen": match.initial_fen,
+        "protocol_version": match.protocol_version,
+        "runtime_profile": match.runtime_profile,
+        "rules_version": match.rules_version,
+        "policy_id": match.policy_id,
+        "policy_version": match.policy_version,
+        "policy_digest": match.policy_digest,
+        "initial_clock_ms": match.initial_clock_ms,
+        "increment_ms": match.increment_ms,
+        "move_timeout_ms": match.move_timeout_ms,
+    }
+    expires = _now() + timedelta(milliseconds=resources.process_lifetime_ms)
+
+    current = (
+        await db.execute(
+            select(WorkerExecutionJob)
+            .where(
+                WorkerExecutionJob.match_id == match.id,
+                WorkerExecutionJob.status.in_([
+                    ExecutionJobStatus.QUEUED,
+                    ExecutionJobStatus.LEASED,
+                    ExecutionJobStatus.ACKNOWLEDGED,
+                    ExecutionJobStatus.CLEANUP_REPORTED,
+                ]),
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    by_part_jobs = {job.participant_id: job for job in current}
+
+    async def ensure_part_job(version: SubmissionVersion) -> WorkerExecutionJob:
+        existing = by_part_jobs.get(version.participant_id)
+        if existing is not None:
+            return existing
+        return await create_execution_job(
+            db,
+            submission_version_id=version.id,
+            initial_state=initial_state,
+            resource_policy=resources,
+            execution_expires_at=expires,
+            match_id=match.id,
+            execution_mode=execution_mode,
+            commit=False,
+        )
+
+    white_job = await ensure_part_job(white_version)
+    black_job = await ensure_part_job(black_version)
+    await db.commit()
+    await db.refresh(white_job)
+    await db.refresh(black_job)
+    return white_job, black_job
+
+
+async def dispatch_match_jobs(
+    db: AsyncSession,
+    *,
+    match_id: uuid.UUID,
+    execution_mode: str = "MODAL_AI_EXECUTION",
+) -> tuple[WorkerExecutionJob, WorkerExecutionJob]:
+    """Unified entrypoint dispatching execution jobs for any valid match."""
+    match = await db.get(Match, match_id)
+    if match is None:
+        raise WorkerProtocolError(404, "MATCH_NOT_FOUND")
+    if match.purpose == MatchPurpose.DEVELOPMENT:
+        return await dispatch_development_match_jobs(db, match_id=match_id)
+    return await dispatch_participant_match_jobs(
+        db, match_id=match_id, execution_mode=execution_mode
+    )
 
 
 def _lease_valid(job: WorkerExecutionJob, worker: Worker, lease_id: uuid.UUID, fence: int) -> None:
@@ -827,7 +1057,7 @@ async def claim_job(
                 | WorkerExecutionJob.match_id.is_(None),
                 (
                     WorkerExecutionJob.match_id.is_(None)
-                    if worker.capabilities.get("sandbox_backend") != "KATA"
+                    if worker.capabilities.get("sandbox_backend") not in {"KATA", "MODAL"}
                     else WorkerExecutionJob.protocol_version.in_(
                         worker.capabilities.get("protocol_versions", [])
                     )
@@ -1085,6 +1315,12 @@ async def submit_evidence(
         raise WorkerProtocolError(409, "EXECUTION_NOT_ACTIVE")
     if evidence.artifact_digest_verified and job.artifact_sha256 == "":
         raise WorkerProtocolError(409, "ARTIFACT_EVIDENCE_INVALID")
+    expected_container_id = f"aik-{execution_id.hex}"
+    if (
+        evidence.resource_measurement_container_id is not None
+        and evidence.resource_measurement_container_id != expected_container_id
+    ):
+        raise WorkerProtocolError(409, "RESOURCE_EVIDENCE_IDENTITY_MISMATCH")
     record = WorkerEvidence(
         execution_id=execution_id, worker_id=worker.worker_id, sequence=evidence.sequence,
         event_type=evidence.event_type.value,
@@ -1097,7 +1333,17 @@ async def submit_evidence(
         stderr_bytes=evidence.stderr_bytes, stderr_sha256=evidence.stderr_sha256,
         protocol_violation=evidence.protocol_violation,
         sandbox_violation=evidence.sandbox_violation,
-        evidence_json={"source": "worker_report", "authoritative": False},
+        evidence_json={
+            "source": "worker_report",
+            "authoritative": False,
+            "measurement_source": evidence.resource_measurement_source,
+            "measurement_scope": evidence.resource_measurement_scope,
+            "measurement_container_id": evidence.resource_measurement_container_id,
+            "measurement_started_monotonic": evidence.resource_measurement_started_monotonic,
+            "measurement_ended_monotonic": evidence.resource_measurement_ended_monotonic,
+            "unavailable_measurements": evidence.unavailable_measurements,
+            "measurement_error": evidence.measurement_error,
+        },
         recorded_at=_now(),
     )
     db.add(record)

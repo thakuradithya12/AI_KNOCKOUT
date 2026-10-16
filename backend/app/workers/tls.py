@@ -158,6 +158,28 @@ class WorkerClientTLSConfig:
     worker_id: str
     server_name: str
 
+    @classmethod
+    def from_env(cls) -> WorkerClientTLSConfig:
+        names = {
+            "WORKER_CLIENT_CA_CERT": os.environ.get("WORKER_CLIENT_CA_CERT") or os.environ.get("WORKER_TLS_CA_CERT"),
+            "WORKER_CLIENT_CERT": os.environ.get("WORKER_CLIENT_CERT") or os.environ.get("WORKER_TLS_CLIENT_CERT"),
+            "WORKER_CLIENT_KEY": os.environ.get("WORKER_CLIENT_KEY") or os.environ.get("WORKER_TLS_CLIENT_KEY"),
+            "WORKER_ID": os.environ.get("WORKER_ID"),
+            "WORKER_GATEWAY_SERVER_NAME": os.environ.get("WORKER_GATEWAY_SERVER_NAME") or os.environ.get("WORKER_TLS_SERVER_NAME"),
+        }
+        missing = [key for key, value in names.items() if not value]
+        if missing:
+            raise WorkerTLSConfigurationError(
+                "required worker client TLS configuration is missing: " + ", ".join(missing)
+            )
+        return cls(
+            ca_certificate=Path(names["WORKER_CLIENT_CA_CERT"]),
+            worker_certificate=Path(names["WORKER_CLIENT_CERT"]),
+            worker_private_key=Path(names["WORKER_CLIENT_KEY"]),
+            worker_id=names["WORKER_ID"],
+            server_name=names["WORKER_GATEWAY_SERVER_NAME"],
+        )
+
     def build_ssl_context(self) -> ssl.SSLContext:
         for name, path in (
             ("CA certificate", self.ca_certificate),

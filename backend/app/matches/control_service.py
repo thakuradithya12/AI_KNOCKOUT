@@ -140,7 +140,11 @@ class DatabaseControlService:
                 or worker.revoked_at is not None
                 or worker.certificate_fingerprint != payload.worker_certificate_fingerprint
                 or job is None or match is None or side is None
-                or match.purpose != MatchPurpose.DEVELOPMENT
+                or match.purpose not in {
+                    MatchPurpose.DEVELOPMENT,
+                    MatchPurpose.OFFICIAL,
+                    MatchPurpose.PEER_TEST,
+                }
                 or match.id != job.match_id or side.match_id != match.id
                 or side.color.value != payload.side
                 or job.assigned_worker_id != payload.worker_id

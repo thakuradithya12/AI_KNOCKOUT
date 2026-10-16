@@ -29,21 +29,25 @@ from app.services.submissions import OrganizerApproval, accept_upload, approve_s
 from app.tournaments.service import get_frozen_official_participants, schedule_official_match
 from tests.fixtures.trusted_engine.builder import build_trusted_engine_archive
 
-# Use dedicated local test database on 5433
-LOCAL_TEST_DB_URL = "postgresql+asyncpg://aik_user:1029N19gmiqVP7qP585J4XN1wHLfrdnuzAkpXh0lDuE@127.0.0.1:5433/aik_e2e_dev"
+import os
+
+# Support external test database URL via TEST_DATABASE_URL or LOCAL_TEST_DB_URL if configured,
+# otherwise fallback to isolated in-memory test session fixture from conftest.
+TEST_DB_URL = os.environ.get("TEST_DATABASE_URL") or os.environ.get("LOCAL_TEST_DB_URL")
 
 
 @pytest_asyncio.fixture
-async def local_db_session():
-    normalized = normalize_async_database_url(LOCAL_TEST_DB_URL)
-    connect_args = get_asyncpg_connect_args(LOCAL_TEST_DB_URL)
-    engine = create_async_engine(normalized, connect_args=connect_args)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-
-    async with session_factory() as session:
-        yield session
-
-    await engine.dispose()
+async def local_db_session(db_session: AsyncSession):
+    if TEST_DB_URL:
+        normalized = normalize_async_database_url(TEST_DB_URL)
+        connect_args = get_asyncpg_connect_args(TEST_DB_URL)
+        engine = create_async_engine(normalized, connect_args=connect_args)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        async with session_factory() as session:
+            yield session
+        await engine.dispose()
+    else:
+        yield db_session
 
 
 @pytest.mark.asyncio

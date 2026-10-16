@@ -130,6 +130,14 @@ def test_locked_policy_is_exact() -> None:
     assert not KataSandboxAdapter._locked_policy(_policy(move_timeout_ms=2001))
 
 
+def test_sandbox_uid_uses_full_execution_identity() -> None:
+    first = uuid.UUID("00000100-0000-0000-0000-000000000001")
+    second = uuid.UUID("000001ff-0000-0000-0000-000000000001")
+
+    assert first.hex[:6] == second.hex[:6]
+    assert KataSandboxAdapter._sandbox_uid(first) != KataSandboxAdapter._sandbox_uid(second)
+
+
 def test_runtime_configuration_requires_digest_pinned_python_image(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="DIGEST_PINNED"):
         KataRuntimeConfig(

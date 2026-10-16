@@ -9,10 +9,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class PackageLimits:
-    max_archive_bytes: int = 16 * 1024 * 1024
+    max_archive_bytes: int = 10 * 1024 * 1024
     max_members: int = 128
     max_member_bytes: int = 4 * 1024 * 1024
-    max_total_bytes: int = 16 * 1024 * 1024
+    max_total_bytes: int = 10 * 1024 * 1024
     max_manifest_bytes: int = 16 * 1024
 
 

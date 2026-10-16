@@ -464,6 +464,7 @@ async def test_execution_binding_requires_exact_acknowledged_worker_jobs_and_rea
     assert accepted.accepted
     await persist_controller_update(db_session, controller)
     await db_session.refresh(match)
+    assert match.result_source is None
     assert match.current_ply == 1
     assert match.current_fen == "after-e4"
     assert match.side_to_move == MatchSideColor.BLACK

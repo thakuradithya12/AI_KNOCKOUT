@@ -54,6 +54,12 @@ class MatchOutcome(str, enum.Enum):
     DRAW = "DRAW"
 
 
+class MatchResultSource(str, enum.Enum):
+    AUTOMATED = "automated"
+    MANUAL = "manual"
+    UNKNOWN = "unknown"
+
+
 class MatchFailure(str, enum.Enum):
     ILLEGAL_MOVE = "ILLEGAL_MOVE"
     MOVE_TIMEOUT = "MOVE_TIMEOUT"
@@ -127,12 +133,16 @@ class Match(Base):
             name="ck_matches_result_reason",
         ),
         CheckConstraint(
+            "result_source IS NULL OR result_source IN ('automated','manual','unknown')",
+            name="ck_matches_result_source_allowed",
+        ),
+        CheckConstraint(
             "(state = 'COMPLETED' AND result_outcome IS NOT NULL AND result_reason IS NOT NULL "
-            "AND failure_reason IS NULL) OR "
+            "AND result_source IS NOT NULL AND failure_reason IS NULL) OR "
             "(state = 'ABORTED' AND result_outcome IS NULL AND result_reason IS NULL "
-            "AND failure_reason IS NOT NULL) OR "
+            "AND result_source IS NULL AND failure_reason IS NOT NULL) OR "
             "(state NOT IN ('COMPLETED','ABORTED') AND result_outcome IS NULL "
-            "AND result_reason IS NULL AND failure_reason IS NULL)",
+            "AND result_reason IS NULL AND result_source IS NULL AND failure_reason IS NULL)",
             name="ck_matches_terminal_authority",
         ),
         CheckConstraint(
@@ -194,6 +204,15 @@ class Match(Base):
     black_remaining_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     result_outcome: Mapped[str | None] = mapped_column(String(16), nullable=True)
     result_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_source: Mapped[MatchResultSource | None] = mapped_column(
+        Enum(
+            MatchResultSource,
+            native_enum=False,
+            length=16,
+            values_callable=lambda values: [item.value for item in values],
+        ),
+        nullable=True,
+    )
     failure_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -423,6 +442,7 @@ _MATCH_MUTABLE_FIELDS = {
     "black_remaining_ms",
     "result_outcome",
     "result_reason",
+    "result_source",
     "failure_reason",
     "started_at",
     "completed_at",
@@ -480,11 +500,17 @@ def enforce_match_immutability(session: Session, _flush_context, _instances) -> 
                 if old_state in {MatchState.COMPLETED, MatchState.ABORTED}:
                     raise ValueError("TERMINAL_MATCH_IMMUTABLE")
             if obj.state == MatchState.COMPLETED and (
-                not obj.result_outcome or not obj.result_reason or obj.failure_reason
+                not obj.result_outcome
+                or not obj.result_reason
+                or not obj.result_source
+                or obj.failure_reason
             ):
                 raise ValueError("COMPLETED_MATCH_REQUIRES_SERVER_RESULT")
             if obj.state == MatchState.ABORTED and (
-                not obj.failure_reason or obj.result_outcome or obj.result_reason
+                not obj.failure_reason
+                or obj.result_outcome
+                or obj.result_reason
+                or obj.result_source
             ):
                 raise ValueError("ABORTED_MATCH_CANNOT_DECLARE_CHESS_RESULT")
     for obj in session.deleted:

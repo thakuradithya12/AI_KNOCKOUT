@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from app.matches.kata_participant import KataMatchParticipant
+from app.models.match import MatchPurpose
 from app.models.worker import ExecutionFailureClass
 from app.sandbox.contract import (
     CleanupResult,
@@ -27,6 +28,7 @@ from app.sandbox.contract import (
     ExecutionSubjectKind,
     ExpiredLeaseError,
     NetworkMode,
+    SandboxAdapter,
     SandboxPolicy,
     StaleFenceError,
     WritableStoragePolicy,
@@ -192,7 +194,7 @@ class WorkerAgent:
         self,
         *,
         client: WorkerGatewayClient,
-        adapter_factory: Callable[[RenewedLeaseFenceAuthority], KataSandboxAdapter],
+        adapter_factory: Callable[[RenewedLeaseFenceAuthority], SandboxAdapter],
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
@@ -211,11 +213,20 @@ class WorkerAgent:
     def execute(self, job: JobOut) -> None:
         if job.worker_id != self.client.worker_id:
             raise WorkerAgentError("JOB_WORKER_IDENTITY_MISMATCH")
-        if job.execution_mode != "KATA_AI_EXECUTION" or job.match_id is None:
+        if job.execution_mode not in {"KATA_AI_EXECUTION", "MODAL_AI_EXECUTION"} or job.match_id is None:
             raise WorkerAgentError("JOB_MODE_UNSUPPORTED")
-        if job.match_side_id is None or job.match_purpose != "DEVELOPMENT":
+        if job.match_side_id is None:
             raise WorkerAgentError("JOB_MATCH_BINDING_INCOMPLETE")
-        if job.policy_digest is None or job.protocol_version != "aik-jsonl/1":
+        if job.match_purpose not in {
+            MatchPurpose.DEVELOPMENT.value,
+            MatchPurpose.OFFICIAL.value,
+            MatchPurpose.PEER_TEST.value,
+        }:
+            raise WorkerAgentError("JOB_PURPOSE_UNSUPPORTED")
+        if (
+            (job.match_purpose == MatchPurpose.DEVELOPMENT.value and job.policy_digest is None)
+            or job.protocol_version != "aik-jsonl/1"
+        ):
             raise WorkerAgentError("JOB_POLICY_OR_PROTOCOL_INVALID")
         if job.runtime_profile != "python-3.12":
             raise WorkerAgentError("JOB_RUNTIME_PROFILE_UNSUPPORTED")
@@ -272,7 +283,11 @@ class WorkerAgent:
                 policy.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
             ).encode("utf-8")
         ).hexdigest()
-        identity = replace(identity, sandbox_policy_digest=sandbox_policy_digest)
+        identity = replace(
+            identity,
+            sandbox_policy_digest=sandbox_policy_digest,
+            policy_digest=job.policy_digest or sandbox_policy_digest,
+        )
         lease_state = _LeaseState(
             expires_monotonic=self.monotonic() + max(
                 0, (job.lease.expires_at - self.wall_clock()).total_seconds()
@@ -293,6 +308,7 @@ class WorkerAgent:
         )
         cleanup_result = CleanupResult.UNKNOWN
         failure_class: ExecutionFailureClass | None = None
+        resource_evidence = None
         renew_thread.start()
         try:
             adapter.create_execution(identity, policy)
@@ -359,6 +375,19 @@ class WorkerAgent:
                     ExecutionState.DESTROYED,
                 }:
                     adapter.terminate(job.execution_id)
+                resource_verifier = getattr(adapter, "verify_resource_evidence", None)
+                if callable(resource_verifier):
+                    resource_evidence = adapter.collect_evidence(job.execution_id)
+                    try:
+                        resource_verifier(job.execution_id)
+                    except Exception:
+                        if terminal_error is None:
+                            terminal_error = WorkerAgentError(
+                                "REQUIRED_RESOURCE_EVIDENCE_UNAVAILABLE"
+                            )
+                        failure_class = (
+                            failure_class or ExecutionFailureClass.INFRASTRUCTURE_FAILURE
+                        )
                 cleanup_result = adapter.verify_cleanup(job.execution_id)
                 if cleanup_result == CleanupResult.VERIFIED:
                     adapter.destroy(job.execution_id)
@@ -370,7 +399,7 @@ class WorkerAgent:
             try:
                 self._report_evidence(
                     job, lease_state, operation_lock, adapter, cleanup_result,
-                    sequence, terminal_error, failure_class,
+                    sequence, terminal_error, failure_class, resource_evidence,
                 )
                 with operation_lock:
                     sequence = lease_state.sequence
@@ -413,11 +442,12 @@ class WorkerAgent:
                 return
 
     def _report_evidence(self, job: JobOut, state: _LeaseState, lock: threading.RLock,
-                         adapter: KataSandboxAdapter, cleanup: CleanupResult,
+                         adapter: SandboxAdapter, cleanup: CleanupResult,
                          initial_sequence: int, error: Exception | None,
-                         failure: ExecutionFailureClass | None) -> None:
+                         failure: ExecutionFailureClass | None,
+                         evidence=None) -> None:
         try:
-            evidence = adapter.collect_evidence(job.execution_id)
+            evidence = evidence or adapter.collect_evidence(job.execution_id)
         except Exception:
             return
         event = EvidenceEvent.FAILED if error else EvidenceEvent.ARTIFACT_VERIFIED
@@ -428,7 +458,14 @@ class WorkerAgent:
             "exit_code": None,
             "failure_class": failure.value if failure else None,
             "termination_reason": (evidence.termination_reason or "UNKNOWN")[:64],
-            "resource_usage": {},
+            "resource_usage": evidence.resource_usage,
+            "resource_measurement_source": evidence.measurement_source,
+            "resource_measurement_scope": evidence.measurement_scope,
+            "resource_measurement_container_id": evidence.measurement_container_id,
+            "resource_measurement_started_monotonic": evidence.measurement_started_monotonic,
+            "resource_measurement_ended_monotonic": evidence.measurement_ended_monotonic,
+            "unavailable_measurements": list(evidence.unavailable_measurements),
+            "measurement_error": evidence.measurement_error,
             "artifact_digest_verified": True,
             "stdout_bytes": min(evidence.stdout_bytes, 1_048_576),
             "stdout_sha256": hashlib.sha256(evidence.stdout_evidence).hexdigest(),
@@ -492,3 +529,138 @@ class WorkerAgent:
         if isinstance(exc, WorkerAgentError):
             return str(exc)[:96]
         return "WORKER_EXECUTION_FAILED"
+
+
+def build_sandbox_adapter_factory(
+    backend: str | None = None,
+) -> Callable[[RenewedLeaseFenceAuthority], SandboxAdapter]:
+    """Return an adapter factory for the configured sandbox backend ('modal', 'kata', 'mock')."""
+    import os
+
+    selected = (backend or os.environ.get("WORKER_SANDBOX_BACKEND", "mock")).strip().lower()
+    if selected == "modal":
+        from app.sandbox.modal import ModalRuntimeConfig, ModalSandboxAdapter
+
+        cfg = ModalRuntimeConfig.from_env()
+
+        def _modal_factory(fence: RenewedLeaseFenceAuthority) -> SandboxAdapter:
+            return ModalSandboxAdapter(authority=fence, config=cfg)
+
+        return _modal_factory
+    elif selected == "kata":
+        from pathlib import Path
+        from app.sandbox.kata import KataRuntimeConfig, KataSandboxAdapter
+
+        cfg = KataRuntimeConfig(
+            ctr_binary=Path(os.environ.get("CTR_BINARY", "/usr/bin/ctr")),
+            containerd_address=Path(os.environ.get("CONTAINERD_ADDRESS", "/run/containerd/containerd.sock")),
+            namespace=os.environ.get("KATA_NAMESPACE", "aik-workers"),
+            base_image=os.environ["KATA_BASE_IMAGE"],
+            base_manifest_digest=os.environ["KATA_BASE_MANIFEST_DIGEST"],
+            runtime=os.environ.get("KATA_RUNTIME", "io.containerd.kata.v2"),
+            runtime_version=os.environ.get("KATA_RUNTIME_VERSION", "4.2.0"),
+            ctr_version=os.environ.get("CTR_VERSION", "2.2.1"),
+            cgroup_parent=Path(os.environ["KATA_CGROUP_PARENT"]) if os.environ.get("KATA_CGROUP_PARENT") else None,
+            staging_parent=Path(os.environ["KATA_STAGING_PARENT"]) if os.environ.get("KATA_STAGING_PARENT") else None,
+        )
+
+        def _kata_factory(fence: RenewedLeaseFenceAuthority) -> SandboxAdapter:
+            return KataSandboxAdapter(authority=fence, config=cfg)
+
+        return _kata_factory
+    elif selected == "mock":
+        from app.sandbox.modal import ModalRuntimeConfig, ModalSandboxAdapter
+
+        mock_cfg = ModalRuntimeConfig(mock_mode=True, sandbox_enabled=False, execution_mode="mock")
+
+        def _mock_factory(fence: RenewedLeaseFenceAuthority) -> SandboxAdapter:
+            return ModalSandboxAdapter(authority=fence, config=mock_cfg)
+
+        return _mock_factory
+    else:
+        raise WorkerAgentError(f"UNKNOWN_SANDBOX_BACKEND: {selected}")
+
+
+def run_agent(
+    *,
+    client: WorkerGatewayClient | None = None,
+    adapter_factory: Callable[[RenewedLeaseFenceAuthority], SandboxAdapter] | None = None,
+    poll_interval: float = 1.0,
+    stop_event: threading.Event | None = None,
+    max_jobs: int | None = None,
+) -> int:
+    """Run worker agent polling loop until stopped or max_jobs processed."""
+    import os
+
+    # Execution-mode fail-closed guard (Gap 3).
+    # Production backends (kata, modal) require SANDBOX_ENABLED=true to be
+    # explicitly set. The mock backend requires SANDBOX_ENABLED=false (or unset).
+    # Any contradictory combination is rejected here — before a job is claimed —
+    # so the process exits with a clear error rather than silently misbehaving.
+    sandbox_backend = (os.environ.get("WORKER_SANDBOX_BACKEND", "mock")).strip().lower()
+    sandbox_enabled_raw = os.environ.get("SANDBOX_ENABLED", "false").strip().lower()
+    sandbox_enabled = sandbox_enabled_raw in {"1", "true", "yes"}
+
+    if sandbox_backend == "mock" and sandbox_enabled:
+        raise WorkerAgentError(
+            "EXECUTION_MODE_CONFLICT: WORKER_SANDBOX_BACKEND=mock but SANDBOX_ENABLED=true. "
+            "Mock mode must not run with sandbox enabled — this would produce results that "
+            "appear genuine. Set SANDBOX_ENABLED=false for mock, or use a real backend."
+        )
+    if sandbox_backend in {"kata", "modal"} and not sandbox_enabled:
+        raise WorkerAgentError(
+            f"EXECUTION_MODE_CONFLICT: WORKER_SANDBOX_BACKEND={sandbox_backend} but "
+            "SANDBOX_ENABLED is not 'true'. Real execution backends require an explicit "
+            "SANDBOX_ENABLED=true acknowledgement after all sandbox release gates pass."
+        )
+
+    if client is None:
+        gateway_url = os.environ.get("WORKER_GATEWAY_URL")
+        if not gateway_url:
+            raise WorkerAgentError("WORKER_GATEWAY_URL_REQUIRED")
+        tls_config = WorkerClientTLSConfig.from_env()
+        client = WorkerGatewayClient(base_url=gateway_url, tls=tls_config)
+
+    if adapter_factory is None:
+        adapter_factory = build_sandbox_adapter_factory()
+
+    agent = WorkerAgent(client=client, adapter_factory=adapter_factory)
+    processed = 0
+    stop = stop_event or threading.Event()
+
+    while not stop.is_set():
+        if max_jobs is not None and processed >= max_jobs:
+            break
+        try:
+            executed = agent.run_once()
+            if executed:
+                processed += 1
+            else:
+                stop.wait(poll_interval)
+        except Exception:
+            stop.wait(poll_interval)
+
+    return processed
+
+
+def main() -> None:
+    import signal
+    import sys
+
+    stop_event = threading.Event()
+
+    def _sig_handler(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    try:
+        run_agent(stop_event=stop_event)
+    except Exception as exc:
+        sys.stderr.write(f"Worker agent terminated: {exc}\n")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

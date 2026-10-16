@@ -179,7 +179,7 @@ class WorkerExecutionJob(Base):
             name="ck_worker_job_version_positive",
         ),
         CheckConstraint(
-            "execution_mode IN ('MOCK_PROTOCOL_ONLY', 'KATA_AI_EXECUTION')",
+            "execution_mode IN ('MOCK_PROTOCOL_ONLY', 'KATA_AI_EXECUTION', 'MODAL_AI_EXECUTION')",
             name="ck_worker_job_execution_mode",
         ),
         ForeignKeyConstraint(

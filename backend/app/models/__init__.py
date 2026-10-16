@@ -19,6 +19,11 @@ from app.models.event import (
     DevelopmentMatchPolicy,
     EventControl,
     OfficialSubmissionSelection,
+    ParticipantSubmissionAllowance,
+    SubmissionAllowanceRequest,
+    TournamentPairingRecord,
+    TournamentRoundRecord,
+    TournamentSnapshot,
 )
 from app.models.house_ai import (
     EventHouseAISelection,
@@ -48,6 +53,7 @@ from app.models.participant import (
     ParticipantSession,
     ParticipantStatus,
 )
+from app.models.organizer import OrganizerAccount, OrganizerSession
 from app.models.system import SystemInfo
 from app.models.worker import (
     ExecutionFailureClass,
@@ -103,9 +109,15 @@ __all__ = [
     "EventControl",
     "DevelopmentMatchPolicy",
     "OfficialSubmissionSelection",
+    "ParticipantSubmissionAllowance",
+    "SubmissionAllowanceRequest",
+    "TournamentSnapshot",
+    "TournamentRoundRecord",
+    "TournamentPairingRecord",
     "HouseAI",
     "HouseAIArtifact",
     "HouseAIVersion",
     "EventHouseAISelection",
     "EventHouseAISelectionControl",
+    "OrganizerSession",
 ]

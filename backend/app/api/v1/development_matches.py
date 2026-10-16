@@ -26,6 +26,8 @@ class DevelopmentMatchRequest(BaseModel):
 
     submission_id: uuid.UUID
     version: StrictInt = Field(ge=1)
+    side: str | None = Field(default="WHITE", pattern="^(WHITE|BLACK|white|black)$")
+    house_ai_id: str | None = Field(default=None, max_length=64)
 
 
 def _raise_http_error(exc: DevelopmentMatchError) -> None:
@@ -59,6 +61,8 @@ async def create_development_match(
             submission_id=body.submission_id,
             version_number=body.version,
             idempotency_key=idempotency_key,
+            side=(body.side or "WHITE").upper(),
+            house_ai_id=body.house_ai_id.strip() if body.house_ai_id else None,
         )
         result = await serialize_participant_development_match(db, match)
     except DevelopmentMatchError as exc:

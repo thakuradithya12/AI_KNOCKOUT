@@ -370,7 +370,10 @@ class MatchController:
             raise ValueError("MATCH_REQUIRES_TWO_EXECUTION_BINDINGS")
         if current_ply < 0:
             raise ValueError("MATCH_PLY_INVALID")
-        if sides[MatchSideColor.WHITE].actor_identity == sides[MatchSideColor.BLACK].actor_identity:
+        if (
+            sides[MatchSideColor.WHITE].actor_identity == sides[MatchSideColor.BLACK].actor_identity
+            and sides[MatchSideColor.WHITE].kind != MatchSideKind.HOUSE_AI
+        ):
             raise ValueError("DUPLICATE_MATCH_SIDE_IDENTITY")
         for color, side in sides.items():
             if (

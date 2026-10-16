@@ -10,19 +10,24 @@ from typing import Any
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_participant, get_db
 from app.core.config import get_settings
 from app.models.competition import Submission, SubmissionVersion, ValidationAttempt
+from app.models.event import SubmissionAllowanceRequest
 from app.models.participant import Participant
 from app.services.submission_validation import PackageLimits
 from app.services.submissions import (
     StorageIntegrityError,
+    SubmissionLimitExceeded,
     accept_upload,
+    create_allowance_request,
     create_submission,
     get_owned_submission,
+    get_participant_quota_summary,
 )
 
 logger = logging.getLogger("ai-knockout.submissions")
@@ -99,6 +104,90 @@ async def list_submissions(
     }
 
 
+class AllowanceRequestCreate(BaseModel):
+    requested_limit: int
+    reason: str
+
+
+@router.get("/quota", summary="Get the authenticated participant's submission quota and usage")
+async def get_my_quota(
+    participant: Participant = Depends(get_current_active_participant),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    return await get_participant_quota_summary(db, participant.participant_id)
+
+
+@router.post(
+    "/allowance-requests",
+    status_code=status.HTTP_201_CREATED,
+    summary="Request an increase to submission quota",
+)
+async def request_allowance_increase(
+    payload: AllowanceRequestCreate,
+    request: Request,
+    participant: Participant = Depends(get_current_active_participant),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", None)
+    try:
+        req = await create_allowance_request(
+            db,
+            participant_id=participant.participant_id,
+            requested_limit=payload.requested_limit,
+            reason=payload.reason,
+            correlation_id=request_id,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content=jsonable_encoder({
+                "id": str(req.id),
+                "participant_id": req.participant_id,
+                "requested_limit": req.requested_limit,
+                "reason": req.reason,
+                "status": req.status,
+                "created_at": req.created_at,
+            }),
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": str(exc)},
+        )
+
+
+@router.get("/allowance-requests", summary="List participant's allowance requests")
+async def list_my_allowance_requests(
+    participant: Participant = Depends(get_current_active_participant),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    try:
+        rows = (
+            await db.execute(
+                select(SubmissionAllowanceRequest)
+                .where(SubmissionAllowanceRequest.participant_id == participant.participant_id)
+                .order_by(SubmissionAllowanceRequest.created_at.desc())
+            )
+        ).scalars().all()
+        return {
+            "items": [
+                {
+                    "id": str(r.id),
+                    "requested_limit": r.requested_limit,
+                    "reason": r.reason,
+                    "status": r.status,
+                    "created_at": r.created_at,
+                    "reviewed_by": r.reviewed_by,
+                    "reviewed_at": r.reviewed_at,
+                    "review_notes": r.review_notes,
+                }
+                for r in rows
+            ]
+        }
+    except Exception:
+        await db.rollback()
+        return {"items": []}
+
+
 @router.get("/{submission_id}", summary="Get an owned submission", response_model=None)
 async def get_submission(
     submission_id: uuid.UUID,
@@ -145,10 +234,17 @@ async def upload_version(
         return _not_found()
 
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-    if content_type not in {"application/x-tar", "application/octet-stream"}:
+    allowed_types = {
+        "application/x-tar",
+        "application/octet-stream",
+        "text/x-python",
+        "text/plain",
+        "text/x-script.python",
+    }
+    if content_type not in allowed_types:
         return JSONResponse(
             status_code=415,
-            content={"error": "UNSUPPORTED_MEDIA_TYPE", "detail": "Upload a raw uncompressed USTAR archive."},
+            content={"error": "UNSUPPORTED_MEDIA_TYPE", "detail": "Upload a raw uncompressed USTAR archive or a Python intelligence.py file."},
         )
     length_header = request.headers.get("content-length")
     if length_header is not None:
@@ -189,9 +285,32 @@ async def upload_version(
             archive_bytes=bytes(body),
             correlation_id=request_id,
             limits=limits,
+            content_type=content_type,
         )
     except LookupError:
         return _not_found()
+    except SubmissionLimitExceeded as exc:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": "SUBMISSION_LIMIT_EXCEEDED",
+                "detail": f"Submission quota exceeded. Limit is {exc.limit}, current accepted count is {exc.current}.",
+                "limit": exc.limit,
+                "current": exc.current,
+                "accepted": exc.current,
+            },
+        )
+    except ValueError as exc:
+        if str(exc) == "OFFICIAL_SUBMISSIONS_FROZEN":
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "OFFICIAL_SUBMISSIONS_FROZEN",
+                    "detail": "Official tournament submissions are frozen. No new packages may be submitted.",
+                },
+            )
+        await db.rollback()
+        raise
     except StorageIntegrityError:
         logger.error("Quarantine object failed digest verification", extra={"request_id": request_id})
         return JSONResponse(status_code=503, content={"error": "ARTIFACT_STORAGE_INTEGRITY_FAILURE"})
@@ -309,3 +428,4 @@ async def get_validation_results(
             for row in rows
         ],
     }
+

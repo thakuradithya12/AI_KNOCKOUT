@@ -7,6 +7,7 @@ Missing required configuration causes immediate failure with clear error message
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Optional
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -65,13 +66,30 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = 60
     rate_limit_register_attempts: int = 100
 
-    # Provisional technical ceilings from AI Knockout Core Contract V1.
-    submission_max_archive_bytes: int = 16 * 1024 * 1024
+    # Organizer OIDC & Server-Managed Session Settings
+    oidc_issuer_url: Optional[str] = None
+    oidc_client_id: Optional[str] = None
+    oidc_client_secret: Optional[str] = None
+    oidc_redirect_uri: Optional[str] = None
+    organizer_allowed_emails: str = ""
+    organizer_session_expire_minutes: int = 480
+    organizer_session_idle_minutes: int = 60
+
+    # Approved technical ceilings from AI Knockout Rules (10 MiB maximum archive size).
+    submission_max_archive_bytes: int = 10 * 1024 * 1024
     submission_max_members: int = 128
     submission_max_member_bytes: int = 4 * 1024 * 1024
-    submission_max_total_bytes: int = 16 * 1024 * 1024
+    submission_max_total_bytes: int = 10 * 1024 * 1024
     submission_max_manifest_bytes: int = 16 * 1024
 
+    @field_validator("app_env")
+    @classmethod
+    def normalize_app_env(cls, value: str) -> str:
+        """Normalize and validate the deployment environment name."""
+        normalized = value.strip().lower()
+        if normalized not in {"development", "test", "staging", "production"}:
+            raise ValueError("APP_ENV must be development, test, staging, or production.")
+        return normalized
 
     @field_validator("secret_key")
     @classmethod
@@ -143,14 +161,31 @@ class Settings(BaseSettings):
         """Check if running in production mode."""
         return self.app_env == "production"
 
+    @property
+    def is_deployed(self) -> bool:
+        """Check if running in a remotely deployed environment."""
+        return self.app_env in {"staging", "production"}
+
+    @property
+    def organizer_allowed_emails_list(self) -> list[str]:
+        """Parse comma-separated allowlist of organizer emails into normalized lowercase list."""
+        if not self.organizer_allowed_emails:
+            return []
+        return [e.strip().lower() for e in self.organizer_allowed_emails.split(",") if e.strip()]
+
+    @property
+    def is_oidc_configured(self) -> bool:
+        """Check if minimum trusted OIDC identity provider configuration is available."""
+        return bool(self.oidc_issuer_url and self.oidc_client_id and self.oidc_client_secret)
+
     @model_validator(mode="after")
     def validate_production_settings(self) -> Settings:
         """Enforce stricter validation in production mode."""
-        if self.is_production:
+        if self.is_deployed:
             if "*" in self.cors_allowed_origins:
-                raise ValueError("Wildcard CORS origins are not allowed in production.")
+                raise ValueError("Wildcard CORS origins are not allowed in deployed environments.")
             if self.db_echo:
-                raise ValueError("Database SQL echo must be disabled in production.")
+                raise ValueError("Database SQL echo must be disabled in deployed environments.")
         return self
 
     @model_validator(mode="after")

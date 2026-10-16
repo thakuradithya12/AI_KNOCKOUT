@@ -97,7 +97,10 @@ class ParticipantSession(TimestampMixin, Base):
     def is_active(self) -> bool:
         """Check if session is currently valid and unexpired."""
         now = datetime.now(timezone.utc)
-        return self.revoked_at is None and self.expires_at > now
+        expires_at = self.expires_at
+        if expires_at.tzinfo is None:  # SQLite returns naive UTC datetimes
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return self.revoked_at is None and expires_at > now
 
 
 class AuthEventType(str, enum.Enum):

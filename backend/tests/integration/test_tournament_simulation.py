@@ -18,6 +18,7 @@ from app.models.match import (
     Match,
     MatchOutcome,
     MatchPurpose,
+    MatchResultSource,
     MatchState,
 )
 from app.tournaments.service import (
@@ -78,6 +79,7 @@ async def _complete_match(
     match.state = MatchState.COMPLETED
     match.result_outcome = outcome
     match.result_reason = reason
+    match.result_source = MatchResultSource.UNKNOWN
     match.completed_at = now
     await session.commit()
 

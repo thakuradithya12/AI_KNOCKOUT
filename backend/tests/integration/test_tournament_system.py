@@ -166,3 +166,75 @@ async def test_tournament_admin_and_spectator_flow(api_client: httpx.AsyncClient
     standing_names = {s["name"] for s in standings}
     assert "Grandmaster_A" in standing_names
     assert "Grandmaster_B" in standing_names
+
+
+@pytest.mark.asyncio
+async def test_empty_tournament_states_return_clean_200(api_client: httpx.AsyncClient):
+    """Clean empty tournament queries return 200 with empty collections (not errors or nulls)."""
+    # 1. Rounds endpoint
+    res_rounds = await api_client.get("/api/v1/tournaments/rounds")
+    assert res_rounds.status_code == 200
+    assert isinstance(res_rounds.json(), list)
+
+    # 2. Matches endpoint
+    res_matches = await api_client.get("/api/v1/tournaments/matches")
+    assert res_matches.status_code == 200
+    assert isinstance(res_matches.json(), list)
+
+    # 3. Leaderboard endpoint
+    res_lb = await api_client.get("/api/v1/tournaments/leaderboard")
+    assert res_lb.status_code == 200
+    lb_data = res_lb.json()
+    assert "standings" in lb_data
+    assert isinstance(lb_data["standings"], list)
+
+    # 4. Bracket endpoint
+    res_bracket = await api_client.get("/api/v1/tournaments/bracket")
+    assert res_bracket.status_code == 200
+    bracket_data = res_bracket.json()
+    assert "rounds" in bracket_data
+    assert isinstance(bracket_data["rounds"], list)
+
+
+@pytest.mark.asyncio
+async def test_genuine_database_failures_return_explicit_500(
+    api_client: httpx.AsyncClient, monkeypatch
+):
+    """When a database query genuinely fails, endpoints return explicit 500 errors instead of masking as empty."""
+    from app.api.deps import get_db
+
+    class FailingSession:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("SIMULATED_DATABASE_CONNECTION_FAILURE")
+
+        async def scalars(self, *args, **kwargs):
+            raise RuntimeError("SIMULATED_DATABASE_CONNECTION_FAILURE")
+
+        async def rollback(self):
+            pass
+
+    from app.main import app
+    app.dependency_overrides[get_db] = lambda: FailingSession()
+
+    try:
+        # 1. Rounds fails with 500
+        res_rounds = await api_client.get("/api/v1/tournaments/rounds")
+        assert res_rounds.status_code == 500
+        assert res_rounds.json()["detail"] == "TOURNAMENT_ROUNDS_UNAVAILABLE"
+
+        # 2. Matches fails with 500
+        res_matches = await api_client.get("/api/v1/tournaments/matches")
+        assert res_matches.status_code == 500
+        assert res_matches.json()["detail"] == "TOURNAMENT_MATCHES_UNAVAILABLE"
+
+        # 3. Leaderboard fails with 500
+        res_lb = await api_client.get("/api/v1/tournaments/leaderboard")
+        assert res_lb.status_code == 500
+        assert res_lb.json()["detail"] == "TOURNAMENT_LEADERBOARD_UNAVAILABLE"
+
+        # 4. Bracket fails with 500
+        res_bracket = await api_client.get("/api/v1/tournaments/bracket")
+        assert res_bracket.status_code == 500
+        assert res_bracket.json()["detail"] == "TOURNAMENT_BRACKET_UNAVAILABLE"
+    finally:
+        app.dependency_overrides.pop(get_db, None)

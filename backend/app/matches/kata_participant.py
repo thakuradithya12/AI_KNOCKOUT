@@ -9,14 +9,14 @@ from __future__ import annotations
 import time
 import uuid
 
-from app.sandbox.contract import AIKMessage, ExecutionState
+from app.sandbox.contract import AIKMessage, ExecutionState, SandboxAdapter
 from app.sandbox.kata import KataRuntimeError, KataSandboxAdapter
 
 
 class KataMatchParticipant:
     """Send one coordinator command to an AI process and collect its response."""
 
-    def __init__(self, *, adapter: KataSandboxAdapter, execution_id: uuid.UUID,
+    def __init__(self, *, adapter: SandboxAdapter, execution_id: uuid.UUID,
                  monotonic=time.monotonic, sleep=time.sleep) -> None:
         self.adapter = adapter
         self.execution_id = execution_id
@@ -45,3 +45,6 @@ class KataMatchParticipant:
 
     def terminate(self) -> None:
         self.adapter.terminate(self.execution_id)
+
+
+SandboxMatchParticipant = KataMatchParticipant
